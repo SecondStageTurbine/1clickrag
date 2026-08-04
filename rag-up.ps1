@@ -22,6 +22,7 @@
   .\rag-up.ps1 status           # health + index size
   .\rag-up.ps1 reindex          # incremental re-ingest  (-Full to rebuild)
   .\rag-up.ps1 query "where is the IPC rendezvous done?"
+  .\rag-up.ps1 ask "how is CHORD deployed?" -Project CHORD   # a prompt, ready for an LLM
   .\rag-up.ps1 bundle           # vendor wheels + model so it installs with no internet
   .\rag-up.ps1 package          # zip the whole thing up for the trip to another PC
   .\rag-up.ps1 logs             # tail the server log
@@ -31,11 +32,15 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('up', 'status', 'query', 'reindex', 'bundle', 'package', 'logs', 'down')]
+    [ValidateSet('up', 'status', 'query', 'ask', 'reindex', 'bundle', 'package', 'logs', 'down')]
     [string]$Command = 'up',
 
     [Parameter(Position = 1)]
     [string]$Query,
+
+    # `ask` only: scope the retrieval to a project configured in
+    # rag-projects.json. Omitted, the project is inferred from the question.
+    [string]$Project,
 
     # -Folder is the whole setup step: point it at the documents you want
     # searchable and it remembers the choice in .env for next time.
@@ -48,6 +53,10 @@ param(
 
     [switch]$Docker,
     [switch]$Full,
+    # `ask` only: deep-dive mode - a wider retrieval window for overviews.
+    [switch]$Deep,
+    # `ask` only: reuse the project's cached background context.
+    [switch]$UseCache,
     [switch]$Wipe,
     [switch]$NoBrowser,
 
@@ -383,9 +392,10 @@ function New-Bundle {
 }
 
 # Zip everything the other machine needs into one file. Excludes .venv (records
-# absolute paths to the Python that built it, so it is rebuilt on arrival) and
+# absolute paths to the Python that built it, so it is rebuilt on arrival),
 # .data\qdrant (the index of THIS machine's corpus - so the zip does not carry a
-# verbatim copy of local documents to somewhere it does not belong).
+# verbatim copy of local documents to somewhere it does not belong) and
+# .data\context-cache, which holds the same document text in plain form.
 function New-Package {
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('rag-package-' + [guid]::NewGuid().ToString('N'))
     $zip = Join-Path (Split-Path $PSScriptRoot -Parent) 'rag-portable.zip'
@@ -402,7 +412,8 @@ function New-Package {
     }
 
     Write-Host '==> staging files' -ForegroundColor Cyan
-    $null = robocopy $PSScriptRoot $stage /E /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant')
+    $null = robocopy $PSScriptRoot $stage /E /XD (Join-Path $PSScriptRoot '.venv') `
+        (Join-Path $Data 'qdrant') (Join-Path $Data 'context-cache')
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
 
     # Strip THIS machine's corpus from the packaged .env. Carrying it over means
@@ -556,6 +567,30 @@ switch ($Command) {
             Write-Host "--- $($hit.path):$($hit.start_line)-$($hit.end_line)  (score $($hit.score))" -ForegroundColor Cyan
             Write-Host $hit.text
         }
+    }
+
+    'ask' {
+        # Retrieval assembled into a grounded-answer prompt. Still no language
+        # model here: what this prints is the input to one.
+        if (-not $Query) { Write-Error "usage: .\rag-up.ps1 ask 'your question' [-Project NAME] [-Deep]" }
+        Import-Module (Join-Path $PSScriptRoot 'rag-client.psm1') -Force -DisableNameChecking
+
+        $askArgs = @{ Question = $Query; Api = $Api }
+        if ($Project)  { $askArgs.Project = $Project }
+        if ($Deep)     { $askArgs.Mode = 'Deep' }
+        if ($UseCache) { $askArgs.UseCache = $true }
+        $answer = Ask-Rag @askArgs
+
+        $scope = 'whole corpus'
+        if ($answer.PathPrefix) { $scope = $answer.PathPrefix }
+        Write-Host ("==> {0} chunks, {1} chars, scope: {2}" -f $answer.ChunksUsed, $answer.Chars, $scope) -ForegroundColor Cyan
+        foreach ($source in $answer.Sources) {
+            Write-Host ("    [{0}] {1}" -f $source.n, $source.citation) -ForegroundColor DarkGray
+        }
+        Write-Host ''
+        # Written to the pipeline, not the host, so it can be redirected into a
+        # file or piped straight to whatever runs the model.
+        $answer.Prompt
     }
 
     'bundle' { New-Bundle }

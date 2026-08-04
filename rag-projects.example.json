@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Copy this to rag-projects.json (same folder as rag-client.psm1) and edit.",
+    "Everything here is optional: with no file at all the client still works,",
+    "it just has no project scoping and no acronym expansion.",
+    "Set-RagProject writes this file for you if you prefer not to hand-edit it."
+  ],
+
+  "api": "http://127.0.0.1:49404",
+
+  "modes": {
+    "quick": { "top_k": 5,  "max_chars": 4000 },
+    "deep":  { "top_k": 25, "max_chars": 20000 }
+  },
+
+  "projects": {
+    "CHORD": {
+      "path_prefix": "Projects/CHORD",
+      "aliases": ["ngpcn", "chord ngpcn"],
+      "language_filter": null,
+      "expand": {
+        "NGPCN": ["NG PCN", "Next Gen PCN", "Next Generation PCN"]
+      }
+    },
+    "E2D": {
+      "path_prefix": "Projects/E2D",
+      "aliases": ["e-2d", "hawkeye"],
+      "language_filter": null
+    },
+    "ESF": {
+      "path_prefix": "Projects/ESF",
+      "aliases": [],
+      "language_filter": "markdown"
+    }
+  },
+
+  "synonyms": {
+    "statement of work": ["SOW", "S.O.W."],
+    "interface control document": ["ICD"]
+  },
+
+  "fallback": {
+    "enabled": true,
+    "min_score": 0.35,
+    "max_lines": 40
+  },
+
+  "long_query_chars": 300,
+  "augment_with_project": true
+}

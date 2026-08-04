@@ -126,6 +126,7 @@ filter, live index status, and a re-index button.
 
 ```powershell
 .\rag-up.ps1 query "where is the IPC rendezvous done?"
+.\rag-up.ps1 ask "how does the boot handoff work?"   # the same hits as a ready prompt
 .\rag-up.ps1 status
 .\rag-up.ps1 reindex          # -Full to rebuild from scratch
 .\rag-up.ps1 logs
@@ -478,6 +479,94 @@ Two things worth telling whoever wires up the generator:
 - **`top_k` of 5-8 is the usual sweet spot.** Past that the relevant passage
   tends to drown rather than the answer improving.
 
+## The PowerShell client (`rag-client.psm1`)
+
+Everything above is the raw HTTP contract. `rag-client.psm1` is the same
+contract with the repetitive parts filled in: project scoping, two query modes,
+acronym normalisation, one standard prompt, a literal-search fallback and a
+per-project context cache. It adds nothing to the server and runs no language
+model - what it returns is the prompt you feed to one.
+
+```powershell
+Import-Module .\rag-client.psm1 -DisableNameChecking
+
+Set-RagProject -Name CHORD -PathPrefix 'Projects/CHORD' -Alias ngpcn
+Ask-Rag 'How is CHORD NGPCN deployed to prod?'    # scope inferred from the alias
+(Ask-Rag 'who owns the prod runbook?').Prompt | Set-Clipboard
+```
+
+`-DisableNameChecking` only silences PowerShell's warning that `Ask-` is not
+one of its approved verbs.
+
+Or without importing anything:
+
+```powershell
+.\rag-up.ps1 ask "how is CHORD deployed?" -Project CHORD          # prints the prompt
+.\rag-up.ps1 ask "explain the architecture" -Project CHORD -Deep
+```
+
+**Project scoping.** Querying the whole of Documents for a question about one
+project is mostly noise. Projects live in `rag-projects.json` (copy
+`rag-projects.example.json`, or let `Set-RagProject` write it) and map a name to
+a `path_prefix`, some aliases and an optional default language filter. A
+question that names a project or one of its aliases is scoped to it
+automatically; `-Project` forces it and `-NoProject` searches everything.
+`Get-RagPrefix` lists the corpus subdirectories, so the prefixes can be read off
+the real layout rather than guessed.
+
+**Two modes.** `Quick` (the default, `top_k` 5) is lookup: *where is this
+documented?* `Deep` (`top_k` 25, `max_chars` 20000) is for overviews and
+explanations. `Ask-RagQuick` and `Ask-RagDeep` are the shorthands, and the
+numbers live under `modes` in the config file.
+
+**One prompt.** Every question is assembled into the same instruction block -
+answer only from the numbered context, cite by number, say you do not know
+rather than filling the gap. Consistency here does more for answer quality than
+any single retrieval knob.
+
+**Grep fallback.** When retrieval returns nothing - or, with reranking off,
+scores below `fallback.min_score` - the client also runs a literal search over
+the same subtree (ripgrep if it is on PATH, `Select-String` otherwise) and
+appends those lines as extra numbered evidence, marked `origin = grep`. Short
+queries stay a literal phrase, which is the ticket-ID and error-code case this
+exists for; longer ones become an alternation over their most distinctive words.
+Plain-text file types only: grep cannot read a PDF.
+
+**Context cache.** The 20-30 chunks that answer "what is this, who owns it,
+which environments" are the same for most questions about a project.
+
+```powershell
+Update-RagContextCache -Project CHORD      # once, or after a big document drop
+Ask-RagDeep 'why does staging differ from prod?' -Project CHORD -UseCache
+```
+
+Cached background is capped at `cache_share` (default 40%) of the character
+budget so the hits that actually answer the question are never the ones dropped,
+and reading a cache older than a week warns.
+
+**Query rewriting.** `synonyms` in the config normalises variants to one
+canonical form (`NG PCN`, `Next Gen PCN` -> `NGPCN`) before embedding, per
+project via `expand` or globally; the project name is appended when the question
+does not already contain it; and a question over `long_query_chars` is reduced to
+its content words, since long prose embeds toward its own filler. `-NoRewrite`
+turns all of it off, and `Expand-RagQuery` shows what a question becomes.
+
+| Function | Purpose |
+| --- | --- |
+| `Ask-Rag`, `Ask-RagQuick`, `Ask-RagDeep` | Retrieve, then assemble the standard prompt |
+| `Get-RagContext` | The same retrieval without the prompt wrapper |
+| `Invoke-RagSearch` | Ranked hits, project-scoped (`-Full` for whole chunks) |
+| `Find-RagLiteral` | Literal search over the corpus, scoped the same way |
+| `Get-RagProject`, `Set-RagProject`, `Remove-RagProject` | Manage projects |
+| `Get-RagPrefix` | Candidate `path_prefix` values from the real corpus layout |
+| `Update-RagContextCache`, `Get-RagContextCache`, `Clear-RagContextCache` | Per-project background context |
+| `Expand-RagQuery` | Show what a question becomes before it is embedded |
+
+`Ask-Rag` returns an object: `.Prompt`, `.Context`, `.Sources`, `.ChunksUsed`,
+`.ChunksDropped`, `.Fallback`, plus the scope it resolved. `-Raw` returns the
+prompt string alone; `-OutFile` writes it. `$env:RAG_API` or `-Api` points the
+client at a server on another port or host.
+
 ## If results look wrong
 
 Retrieval quality is the one thing worth tuning, and there are three dials.
@@ -514,7 +603,9 @@ contains.
 Use RAG for conceptual questions — *"what is our refund policy for damaged
 goods?"*, *"where is the capability revoke walk?"* — anywhere you don't know the
 file. Use `grep` for exact symbols or strings, or when you know the path: it is
-faster and more precise for those. The two are complements, not competitors.
+faster and more precise for those. The two are complements, not competitors -
+`Find-RagLiteral` is the grep half, scoped to the same project subtree, and the
+client falls back to it automatically when retrieval comes up empty.
 
 ## Checking the corpus without installing anything
 
