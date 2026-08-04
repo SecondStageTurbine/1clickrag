@@ -2,6 +2,10 @@
 # the path to your corpus and is specific to the machine it was written on.
 .env
 
+# Your projects, prefixes and acronyms for the PowerShell client.
+# rag-projects.example.json is the committed template.
+rag-projects.json
+
 # The vector index and the downloaded model weights. Rebuildable from the
 # corpus, large, and never worth committing.
 .data/
