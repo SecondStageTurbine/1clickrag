@@ -1,0 +1,19 @@
+# Per-machine state only. .env.example is the committed template; .env carries
+# the path to your corpus and is specific to the machine it was written on.
+.env
+
+# The vector index and the downloaded model weights. Rebuildable from the
+# corpus, large, and never worth committing.
+.data/
+
+# The virtualenv rag-up creates on first run.
+.venv/
+
+# Wheels vendored by `rag-up bundle` for offline install on another machine.
+vendor/
+
+# Packages produced by `rag-up package`.
+*.zip
+
+__pycache__/
+*.pyc

@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MPL-2.0
+# Native mode: everything in one Python process — no Docker, no daemons.
+# fastembed brings onnxruntime, which is what actually runs the model locally.
+-r requirements.txt
+fastembed>=0.8,<1

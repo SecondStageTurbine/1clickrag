@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# Floors with major-version ceilings rather than exact pins: this has to install
+# on whatever Python the machine already has, and an exact pin of a package with
+# a compiled dependency (pydantic -> pydantic-core) fails outright on a newer
+# interpreter than that pin was built for. `rag-up bundle` freezes the actually
+# resolved set into vendor/wheels, which is where reproducibility matters.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+qdrant-client>=1.12,<2
+httpx>=0.27,<1
+watchdog>=6,<7
+pydantic>=2.10,<3
+
+# Document readers. Each is optional at runtime - a missing one skips that
+# format with an explanatory log line instead of failing the ingest - but they
+# are installed by default because a folder of company files is mostly these.
+pypdf>=5,<7            # .pdf
+python-docx>=1.1,<2    # .docx
+python-pptx>=1,<2      # .pptx
+openpyxl>=3.1,<4       # .xlsx / .xlsm
+xlrd>=2,<3             # legacy .xls
+striprtf>=0.0.26,<1    # .rtf
+extract-msg>=0.54,<1   # Outlook .msg

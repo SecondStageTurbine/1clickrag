@@ -1,0 +1,220 @@
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local RAG — semantic code search</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --panel: #f6f7f9;
+    --border: #dfe3e8;
+    --text: #16191d;
+    --muted: #6b7280;
+    --accent: #2f6feb;
+    --code-bg: #f2f4f7;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1116;
+      --panel: #161b22;
+      --border: #262c36;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --code-bg: #11161d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    border-bottom: 1px solid var(--border); padding: 14px 20px;
+  }
+  .bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  #status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: #2ea043; } .dot.warn { background: #d29922; } .dot.bad { background: #da3633; }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  input, select, button {
+    font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
+  }
+  #q { flex: 1 1 380px; }
+  button { background: var(--accent); color: #fff; border-color: transparent; cursor: pointer; font-weight: 600; }
+  button:disabled { opacity: .55; cursor: default; }
+  button.ghost { background: var(--panel); color: var(--text); border-color: var(--border); font-weight: 500; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 4px 0 18px; }
+  .hint code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
+  .result { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 12px; overflow: hidden; }
+  .result h2 {
+    margin: 0; padding: 9px 12px; background: var(--panel); font-size: 13px; font-weight: 600;
+    font-family: var(--mono); display: flex; justify-content: space-between; gap: 12px; align-items: baseline;
+  }
+  .result h2 .score { color: var(--muted); font-weight: 400; flex: none; }
+  .result .sym { color: var(--muted); font-size: 12px; padding: 6px 12px 0; font-family: var(--mono); }
+  pre {
+    /* Wrap rather than scroll: prose lines in a document are far longer than a
+       screen, and a horizontal scrollbar hides the end of every sentence.
+       pre-wrap keeps indentation intact, so code stays readable. */
+    margin: 0; padding: 12px; background: var(--code-bg);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>Local RAG</h1>
+    <div id="status"><span class="dot"></span><span id="status-text">checking…</span></div>
+    <div style="flex:1"></div>
+    <button class="ghost" id="reindex" type="button">Re-index</button>
+  </div>
+</header>
+
+<main>
+  <form id="form">
+    <input id="q" placeholder="Ask semantically — e.g. where is the IPC rendezvous done?" autofocus>
+    <select id="lang" title="Language filter">
+      <option value="">any language</option>
+      <option value="rs">rs</option>
+      <option value="markdown">markdown</option>
+      <option value="toml">toml</option>
+      <option value="yaml">yaml</option>
+      <option value="json">json</option>
+      <option value="ld">ld</option>
+      <option value="conf">conf</option>
+      <option value="sh">sh</option>
+      <option value="ps1">ps1</option>
+      <option value="py">py</option>
+      <option value="asm">asm</option>
+    </select>
+    <input id="prefix" placeholder="path prefix" style="flex:0 1 160px">
+    <select id="topk" title="Results">
+      <option>5</option><option>10</option><option>20</option>
+    </select>
+    <button id="go" type="submit">Search</button>
+  </form>
+  <p class="hint">
+    Semantic search — best for “where is X done?”. For an exact symbol or string,
+    <code>grep</code> is still faster and more precise. Same index the API serves on
+    <code>POST /search</code> and <code>/search/full</code>.
+  </p>
+  <div id="results"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function refreshStatus() {
+  const dot = document.querySelector('.dot');
+  try {
+    const h = await (await fetch('/health')).json();
+    const cls = h.status === 'healthy' ? 'ok' : (h.status === 'degraded' ? 'bad' : 'warn');
+    dot.className = 'dot ' + cls;
+    let text = `${h.status} · ${h.chunks.toLocaleString()} chunks · ${h.model}`;
+    if (h.error) text += ` · ${h.error}`;
+    if (h.warning) text += ` · ⚠ ${h.warning}`;
+    $('status-text').textContent = text;
+    return h;
+  } catch (e) {
+    dot.className = 'dot bad';
+    $('status-text').textContent = 'API unreachable';
+    return null;
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+  ));
+}
+
+function render(data) {
+  const box = $('results');
+  if (!data.results || !data.results.length) {
+    box.innerHTML = '<div class="empty">No matches.</div>';
+    return;
+  }
+  box.innerHTML = data.results.map((r) => {
+    // The symbol is a useful label for a function signature or a heading, and
+    // pure noise for plain text, where it is simply the chunk's first line
+    // repeated directly above itself. Show it only when it adds something.
+    const firstLine = (r.text || '').split('\n').find((l) => l.trim()) || '';
+    // The symbol is truncated to 120 chars at index time, so an equality test
+    // misses the common case of it being a clipped copy of line one.
+    const sym = (r.symbol || '').trim();
+    // Strip the Markdown heading markers first: the symbol is the heading text
+    // without them, so a raw comparison always "differs" and shows the label
+    // directly above the identical heading.
+    const bare = firstLine.trim().replace(/^#{1,6}\s*/, '');
+    const showSymbol = sym && !bare.startsWith(sym.slice(0, 60));
+    return `
+    <div class="result">
+      <h2><span>${escapeHtml(r.path)}:${r.start_line}–${r.end_line}</span>
+          <span class="score">${r.language} · ${r.score.toFixed(3)}</span></h2>
+      ${showSymbol ? `<div class="sym">${escapeHtml(r.symbol)}</div>` : ''}
+      <pre>${escapeHtml(r.text)}</pre>
+    </div>`;
+  }).join('');
+}
+
+$('form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const query = $('q').value.trim();
+  if (!query) return;
+  $('go').disabled = true;
+  $('results').innerHTML = '<div class="empty">Searching…</div>';
+  try {
+    const response = await fetch('/search/full', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        query,
+        top_k: parseInt($('topk').value, 10),
+        language_filter: $('lang').value || null,
+        path_prefix: $('prefix').value.trim() || null,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      $('results').innerHTML =
+        `<div class="empty">${escapeHtml(data.error || 'search failed')} — ${escapeHtml(data.detail || '')}</div>`;
+    } else {
+      render(data);
+    }
+  } catch (e) {
+    $('results').innerHTML = `<div class="empty">${escapeHtml(String(e))}</div>`;
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+$('reindex').addEventListener('click', async () => {
+  $('reindex').disabled = true;
+  await fetch('/reindex', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({full: false}),
+  });
+  const poll = setInterval(async () => {
+    const h = await refreshStatus();
+    if (h && !h.indexing) { clearInterval(poll); $('reindex').disabled = false; }
+  }, 2000);
+});
+
+refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>

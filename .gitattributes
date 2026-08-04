@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# The repository root normalises everything to LF. PowerShell scripts are the
+# one place that hurts: Windows PowerShell 5.1 mis-parses some constructs in an
+# LF-only file (a here-string terminator is not recognised, and the remainder of
+# the script is swallowed into a string literal). These files only ever run on
+# Windows, so check them out with CRLF.
+*.ps1 text eol=crlf

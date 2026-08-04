@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# One-command local RAG: vector DB + embedding model + API + browser UI.
+#
+#   cd rag && docker compose up -d      (or: ./rag-up.sh / .\rag-up.ps1)
+#   open http://127.0.0.1:8404
+#
+# Nothing leaves the machine and nothing is published beyond loopback: every
+# port is bound to 127.0.0.1 explicitly, so the index is not reachable from the
+# LAN even on a laptop with a permissive firewall.
+#
+# To point this at a DIFFERENT repository, set RAG_REPO_PATH (host path) in
+# rag/.env — no other change is needed.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: rag-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:0.5.4
+    container_name: rag-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    # GPU (optional, big speedup on first ingest). Uncomment with the NVIDIA
+    # container toolkit installed; CPU works fine for an embedding model.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local-rag-api:latest
+    container_name: rag-api
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+      - ollama
+    ports:
+      - "127.0.0.1:8404:8404"
+    volumes:
+      # The corpus. Read-only: the indexer never writes to your source tree.
+      - ${RAG_REPO_PATH:-..}:/repo:ro
+    environment:
+      RAG_MODE: docker
+      RAG_QDRANT_URL: http://qdrant:6333
+      RAG_OLLAMA_URL: http://ollama:11434
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-nomic-embed-text}
+      RAG_COLLECTION: ${RAG_COLLECTION:-codebase}
+      RAG_REPO_LABEL: ${RAG_REPO_LABEL:-corpus}
+      RAG_WATCH: ${RAG_WATCH:-1}
+      RAG_INGEST_ON_START: ${RAG_INGEST_ON_START:-1}
+
+volumes:
+  qdrant-storage:
+  ollama-models:
