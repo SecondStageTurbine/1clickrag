@@ -417,11 +417,13 @@ function New-Package {
     Write-Host '==> staging files' -ForegroundColor Cyan
     # /XF as well as /XD: the keyword index and entity graph are a single file
     # (plus its write-ahead log), and FTS5 keeps a verbatim copy of every chunk
-    # it indexes - packing it would ship the corpus inside the tool.
+    # it indexes - packing it would ship the corpus inside the tool. /XF takes a
+    # bare name pattern: robocopy rejects a fully qualified path with a wildcard
+    # in it outright (invalid parameter), which /XD accepts happily.
     $null = robocopy $PSScriptRoot $stage /E `
         /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant') `
             (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
-        /XF (Join-Path $Data 'graph.db*')
+        /XF 'graph.db*'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
 
     # Strip THIS machine's corpus from the packaged .env. Carrying it over means
