@@ -396,9 +396,10 @@ function New-Bundle {
 # .data\qdrant (the index of THIS machine's corpus - so the zip does not carry a
 # verbatim copy of local documents to somewhere it does not belong),
 # .data\context-cache and .data\graph.db, which hold the same document text in
-# plain form (FTS5 stores what it indexes), and .git: this is a tool being
+# plain form (FTS5 stores what it indexes), .git - this is a tool being
 # delivered, not a checkout being cloned, and the whole history would otherwise
-# ride along in every copy.
+# ride along in every copy - and the pid/log files, which describe a run on this
+# machine and mean nothing on the next one.
 function New-Package {
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('rag-package-' + [guid]::NewGuid().ToString('N'))
     $zip = Join-Path (Split-Path $PSScriptRoot -Parent) 'rag-portable.zip'
@@ -417,13 +418,16 @@ function New-Package {
     Write-Host '==> staging files' -ForegroundColor Cyan
     # /XF as well as /XD: the keyword index and entity graph are a single file
     # (plus its write-ahead log), and FTS5 keeps a verbatim copy of every chunk
-    # it indexes - packing it would ship the corpus inside the tool. /XF takes a
-    # bare name pattern: robocopy rejects a fully qualified path with a wildcard
-    # in it outright (invalid parameter), which /XD accepts happily.
+    # it indexes - packing it would ship the corpus inside the tool. The runtime
+    # state goes too: a pid from this machine, and a log naming this machine's
+    # paths, are meaningless on the target and are overwritten by its first run
+    # anyway. /XF takes a bare name pattern: robocopy rejects a fully qualified
+    # path with a wildcard in it outright (invalid parameter), which /XD accepts
+    # happily.
     $null = robocopy $PSScriptRoot $stage /E `
         /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant') `
             (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
-        /XF 'graph.db*'
+        /XF 'graph.db*' 'rag.pid' 'rag.log' 'rag.log.err'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
 
     # Strip THIS machine's corpus from the packaged .env. Carrying it over means
