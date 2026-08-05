@@ -52,6 +52,8 @@ class IngestStats:
     files_scanned: int = 0
     files_indexed: int = 0
     files_skipped: int = 0
+    files_unchanged: int = 0
+    files_removed: int = 0
     chunks: int = 0
     errors: int = 0
 
@@ -60,9 +62,28 @@ class IngestStats:
             "files_scanned": self.files_scanned,
             "files_indexed": self.files_indexed,
             "files_skipped": self.files_skipped,
+            "files_unchanged": self.files_unchanged,
+            "files_removed": self.files_removed,
             "chunks": self.chunks,
             "errors": self.errors,
         }
+
+
+def source_mtime(cfg: Config, rel_path: str) -> float | None:
+    """Modification time of the real file behind a path, or None if it is gone.
+
+    Archive members resolve to the archive itself: a document inside a zip
+    cannot change without the zip changing, and statting the member would mean
+    opening the archive for every file in it on every scan.
+    """
+    from .archive import split_member
+
+    member = split_member(rel_path)
+    source = member[0] if member else rel_path
+    try:
+        return round(os.path.getmtime(os.path.join(cfg.repo_path, source)), 3)
+    except OSError:
+        return None
 
 
 def index_file(
@@ -85,6 +106,7 @@ def index_file(
         stats.files_skipped += 1
         return
 
+    mtime = source_mtime(cfg, rel_path)
     chunks = chunk_file(
         rel_path,
         language,
@@ -111,7 +133,7 @@ def index_file(
     vectors = embedder.embed_documents(payloads, batch_size=cfg.embed_batch)
 
     store.delete_path(rel_path)
-    store.upsert(chunks, vectors)
+    store.upsert(chunks, vectors, mtime=mtime)
 
     # The sidecar is updated from the same place, with the same delete-then-
     # insert, so keyword search and the entity graph cannot drift from the
@@ -127,6 +149,78 @@ def index_file(
 
     stats.files_indexed += 1
     stats.chunks += len(chunks)
+
+
+def _reconcile(
+    cfg: Config,
+    store: Store,
+    targets: list[tuple[str, str]],
+    stats: IngestStats,
+) -> list[tuple[str, str]]:
+    """Compare the index against the corpus and return only the stale files.
+
+    This is what makes the index survive being switched off. The watcher sees
+    changes only while the process is alive, so anything added, edited or
+    deleted in between is invisible to it - and an index quietly missing a
+    document is indistinguishable, from the outside, from a question that has
+    no answer.
+
+    Also what makes a plain reindex cheap: unchanged files keep their vectors
+    instead of being re-embedded, and embedding is the entire cost of a run.
+    """
+    try:
+        indexed = store.indexed_state()
+    except Exception as exc:
+        # Reconciliation is an optimisation plus a correctness sweep; if the
+        # scroll fails, index everything rather than nothing.
+        log.warning("could not read the index state, re-indexing everything: %s", exc)
+        return targets
+
+    present = {rel_path for rel_path, _ in targets}
+    stale: list[tuple[str, str]] = []
+    for rel_path, language in targets:
+        known = indexed.get(rel_path)
+        current = source_mtime(cfg, rel_path)
+        if known and current is not None and known.get("mtime") == current:
+            stats.files_unchanged += 1
+            continue
+        stale.append((rel_path, language))
+
+    # Anything the index holds that the corpus no longer offers: deleted,
+    # renamed, moved out, newly excluded, or a member of an archive that no
+    # longer contains it.
+    vanished = sorted({path for path in indexed if path not in present})
+    if vanished:
+        # A share that failed to mount looks exactly like a corpus where every
+        # file was deleted, and acting on that would empty the index in one
+        # pass. Requiring the corpus to still hold something makes the
+        # difference: an empty walk is treated as a fault, not as an
+        # instruction.
+        if not present and indexed:
+            log.warning(
+                "the corpus looks empty (%s) while the index holds %d file(s) - "
+                "skipping deletions, since an unreachable folder is not the same "
+                "as an emptied one",
+                cfg.repo_path,
+                len(indexed),
+            )
+        else:
+            graph = open_graph(cfg)
+            for rel_path in vanished:
+                store.delete_path(rel_path)
+                if graph is not None:
+                    try:
+                        graph.delete_path(rel_path)
+                    except Exception as exc:
+                        log.warning("graph delete failed for %s: %s", rel_path, exc)
+                stats.files_removed += 1
+            log.info("removed %d file(s) no longer in the corpus", len(vanished))
+
+    if stats.files_unchanged:
+        log.info(
+            "%d file(s) unchanged since the last index - skipping", stats.files_unchanged
+        )
+    return stale
 
 
 def run_ingest(
@@ -182,6 +276,8 @@ def run_ingest(
                     targets.append((rel_path, language))
         else:
             targets = list(iter_source_files(cfg))
+            if not full:
+                targets = _reconcile(cfg, store, targets, stats)
 
         total = len(targets)
         log.info("indexing %d file(s) from %s", total, cfg.repo_path)
@@ -207,9 +303,11 @@ def run_ingest(
                 log.info("  %d/%d files (%d chunks)", i, total, stats.chunks)
 
         log.info(
-            "ingest complete: %d indexed, %d skipped, %d chunks, %d errors "
-            "(collection now holds %d points)",
+            "ingest complete: %d indexed, %d unchanged, %d removed, %d skipped, "
+            "%d chunks, %d errors (collection now holds %d points)",
             stats.files_indexed,
+            stats.files_unchanged,
+            stats.files_removed,
             stats.files_skipped,
             stats.chunks,
             stats.errors,

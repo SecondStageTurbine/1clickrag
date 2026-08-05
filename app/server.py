@@ -62,9 +62,50 @@ STATE: dict = {
     "ingest_running": False,
     "ingest_error": None,
     "last_ingest": None,
+    "last_reconcile": None,
     "started_at": time.time(),
     "warning": None,
 }
+
+
+def start_rescan(cfg) -> threading.Thread:
+    """Re-walk the corpus every `rescan_minutes`, forever.
+
+    Belt to the watcher's braces, and the only thing that works at all on a
+    network share: SMB does not deliver change notifications dependably, so
+    RAG_WATCH defaults off there and this is what keeps the index current.
+    Cheap by design - unchanged files are skipped on modification time, so a
+    quiet corpus costs a directory walk and no embedding.
+    """
+
+    def loop() -> None:
+        interval = cfg.rescan_minutes * 60
+        while True:
+            time.sleep(interval)
+            if STATE["ingest_running"]:
+                continue  # a reindex or the watcher already has the lock
+            STATE["ingest_running"] = True
+            try:
+                stats = run_ingest(cfg, full=False, store=store, embedder=embedder)
+                STATE["last_ingest"] = time.time()
+                STATE["last_reconcile"] = stats.as_dict()
+                if stats.files_indexed or stats.files_removed:
+                    log.info(
+                        "rescan: %d changed, %d removed",
+                        stats.files_indexed,
+                        stats.files_removed,
+                    )
+            except Exception as exc:
+                # Never let a failed sweep kill the loop: a share that is down
+                # now is usually back in fifteen minutes.
+                log.warning("rescan failed: %s", exc)
+            finally:
+                STATE["ingest_running"] = False
+
+    thread = threading.Thread(target=loop, name="rag-rescan", daemon=True)
+    thread.start()
+    log.info("rescanning %s every %d minute(s)", cfg.repo_path, cfg.rescan_minutes)
+    return thread
 
 
 class SearchRequest(BaseModel):
@@ -100,6 +141,18 @@ def _bootstrap() -> None:
             log.info("index is empty - running first ingest")
             run_ingest(CONFIG, full=False, store=store, embedder=embedder)
             STATE["last_ingest"] = time.time()
+        elif CONFIG.reconcile_on_start:
+            # Catch up on whatever happened while this was not running. The
+            # watcher cannot see any of it, and unchanged files are skipped by
+            # modification time, so the usual cost of this is one directory
+            # walk and no embedding at all.
+            if CONFIG.auto_pull_model:
+                embedder.prepare()
+            store.ensure_collection(embedder.dim)
+            log.info("index holds %d chunks - reconciling against the corpus", store.count())
+            stats = run_ingest(CONFIG, full=False, store=store, embedder=embedder)
+            STATE["last_ingest"] = time.time()
+            STATE["last_reconcile"] = stats.as_dict()
         else:
             if CONFIG.auto_pull_model:
                 embedder.prepare()
@@ -113,6 +166,8 @@ def _bootstrap() -> None:
 
         if CONFIG.watch:
             start_watcher(CONFIG, store=store, embedder=embedder)
+        if CONFIG.rescan_minutes > 0:
+            start_rescan(CONFIG)
     except Exception as exc:
         STATE["ingest_error"] = str(exc)
         log.error("bootstrap failed: %s", exc)
@@ -210,8 +265,10 @@ def stats():
         "embed_backend": embedder.backend,
         "vector_store": "embedded" if store.embedded else "server",
         "watching": CONFIG.watch,
+        "rescan_minutes": CONFIG.rescan_minutes,
         "indexing": STATE["ingest_running"],
         "last_ingest": STATE["last_ingest"],
+        "last_reconcile": STATE["last_reconcile"],
         "uptime_seconds": round(time.time() - STATE["started_at"], 1),
         "error": STATE["ingest_error"],
     }
@@ -583,8 +640,9 @@ def reindex(request: ReindexRequest):
         STATE["ingest_running"] = True
         STATE["ingest_error"] = None
         try:
-            run_ingest(CONFIG, full=request.full, store=store, embedder=embedder)
+            stats = run_ingest(CONFIG, full=request.full, store=store, embedder=embedder)
             STATE["last_ingest"] = time.time()
+            STATE["last_reconcile"] = stats.as_dict()
         except Exception as exc:
             STATE["ingest_error"] = str(exc)
             log.error("reindex failed: %s", exc)
