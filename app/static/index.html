@@ -88,6 +88,27 @@
     border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
   }
   .result h2 .origins { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--muted); }
+  .hops-group { display: inline-flex; align-items: center; gap: 7px; }
+  .info {
+    position: relative; display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border-radius: 50%; cursor: help; flex: none;
+    border: 1px solid var(--border); background: var(--panel);
+    color: var(--muted); font-size: 11px; font-weight: 700; user-select: none;
+  }
+  .info:hover, .info:focus { border-color: var(--accent); color: var(--accent); outline: none; }
+  .info .tip {
+    /* Anchored left rather than centred: this control sits near the left edge
+       on a wrapped row, and a centred popup would hang off the page there. */
+    display: none; position: absolute; top: calc(100% + 9px); left: -6px; z-index: 20;
+    width: max-content; max-width: min(360px, 82vw); text-align: left;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 9px;
+    padding: 11px 13px; color: var(--text); font-size: 12.5px; font-weight: 400;
+    line-height: 1.5; box-shadow: 0 8px 24px rgba(0, 0, 0, .28); cursor: default;
+  }
+  .info:hover .tip, .info:focus .tip, .info:focus-within .tip { display: block; }
+  .tip dt { font-weight: 650; margin-top: 7px; }
+  .tip dt:first-child { margin-top: 0; }
+  .tip dd { margin: 1px 0 0; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -125,19 +146,37 @@
            title="Fuse BM25 keyword search with the vector ranking. Finds exact strings — ticket IDs, part numbers — that mean nothing in embedding space.">
       <input type="checkbox" id="hybrid" checked> keyword
     </label>
-    <select id="hops" class="graph-only" hidden
-            title="Resolve the names in the question to entities, walk out through the documents they share, and add what that reaches as candidates.">
-      <option value="0">no hops</option>
-      <option value="1">1 hop</option>
-      <option value="2">2 hops</option>
-    </select>
+    <span class="hops-group graph-only" hidden>
+      <select id="hops"
+              title="Follow names from the pages that match your question out to the other pages mentioning them.">
+        <option value="0">no hops</option>
+        <option value="1">1 hop</option>
+        <option value="2">2 hops</option>
+      </select>
+      <span class="info" tabindex="0" role="note" aria-label="When to use hops">?<span class="tip">
+        <dl>
+          <dt>No hops — one passage</dt>
+          <dd>A specific definition, a policy line, an exact string. You already
+              know what you are looking for and want the place it is written.</dd>
+          <dt>1 hop — the immediate trail</dt>
+          <dd>Everywhere else the names in your question appear: the other uses
+              of a function, the price list for a part number, the documents
+              naming a project. Finds pages that share no wording with your
+              question at all.</dd>
+          <dt>2 hops — the wider map</dt>
+          <dd>Follows those names' names in turn, for tracing how things connect
+              across several files. Casts a much wider net, so expect more noise.</dd>
+        </dl>
+      </span></span>
+    </span>
     <button id="go" type="submit">Search</button>
   </form>
   <p class="hint">
     Semantic search — best for “where is X done?”. With <b>keyword</b> on, exact
     strings are found too, so <code>grep</code> is only needed for files outside the
-    index. <b>Hops</b> answers “what else is involved”, by walking the entity graph.
-    Same index the API serves on <code>POST /search</code> and <code>/search/full</code>.
+    index. <b>Hops</b> pulls in files connected by a shared name — the other places
+    a function, part number or project is mentioned. Same index the API serves on
+    <code>POST /search</code> and <code>/search/full</code>.
   </p>
   <div id="meta" class="meta" hidden></div>
   <div id="results"></div>
