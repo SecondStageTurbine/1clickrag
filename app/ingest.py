@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from .chunker import chunk_file
 from .config import CONFIG, Config
 from .embedder import make_embedder
+from .graph import open_graph
 from .scanner import (
     is_excluded,
     iter_archive_members,
@@ -112,6 +113,18 @@ def index_file(
     store.delete_path(rel_path)
     store.upsert(chunks, vectors)
 
+    # The sidecar is updated from the same place, with the same delete-then-
+    # insert, so keyword search and the entity graph cannot drift from the
+    # vectors across incremental re-ingests. A failure here is logged and
+    # swallowed: losing the graph for one file is a degraded search, while
+    # letting it abort the ingest would lose the vectors too.
+    graph = open_graph(cfg)
+    if graph is not None:
+        try:
+            graph.replace_path(rel_path, chunks)
+        except Exception as exc:
+            log.warning("graph update failed for %s: %s", rel_path, exc)
+
     stats.files_indexed += 1
     stats.chunks += len(chunks)
 
@@ -145,6 +158,12 @@ def run_ingest(
             embedder.prepare()
 
         store.ensure_collection(embedder.dim, recreate=full)
+
+        graph = open_graph(cfg)
+        if graph is not None and full:
+            # A full rebuild drops the collection; the sidecar has to go with
+            # it, or deleted files survive in keyword search and the graph.
+            graph.clear()
 
         if paths is not None:
             from .archive import is_archive
@@ -205,9 +224,15 @@ def remove_paths(cfg: Config, paths: list[str], store: Store | None = None) -> N
     store = store or Store(cfg.qdrant_url, cfg.collection, cfg.qdrant_path)
     if not store.exists():
         return
+    graph = open_graph(cfg)
     with INGEST_LOCK:
         for rel_path in paths:
             store.delete_path(rel_path)
+            if graph is not None:
+                try:
+                    graph.delete_path(rel_path)
+                except Exception as exc:
+                    log.warning("graph delete failed for %s: %s", rel_path, exc)
             log.info("removed %s from index", rel_path)
 
 

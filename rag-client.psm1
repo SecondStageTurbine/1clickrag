@@ -595,6 +595,120 @@ function Resolve-RagQueryPlan {
 
 # ----------------------------------------------------------------- searching
 
+function Get-RagEntity {
+    <#
+    .SYNOPSIS
+      The names the index knows about, most-mentioned first.
+    .DESCRIPTION
+      Boilerplate is hidden by default: anything appearing in more than the
+      server's document-frequency ceiling is a header, a footer or the corpus's
+      own subject, and connects everything to everything. -IncludeCommon shows
+      what is being filtered.
+    .EXAMPLE
+      Get-RagEntity -Contains NW- -Kind identifier
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)][string]$Contains,
+        [ValidateSet('name', 'acronym', 'identifier')][string]$Kind,
+        [string]$Project,
+        [string]$PathPrefix,
+        [int]$Limit = 50,
+        [switch]$IncludeCommon,
+        [string]$Api
+    )
+
+    $prefix = $PathPrefix
+    if (-not $prefix -and $Project) { $prefix = (Get-RagProject -Name $Project).PathPrefix }
+
+    $query = @("limit=$Limit")
+    if ($Contains)      { $query += "contains=$([uri]::EscapeDataString($Contains))" }
+    if ($Kind)          { $query += "kind=$Kind" }
+    if ($prefix)        { $query += "path_prefix=$([uri]::EscapeDataString($prefix))" }
+    if ($IncludeCommon) { $query += 'include_common=true' }
+
+    $response = Invoke-RagApi -Route ("/entities?" + ($query -join '&')) -Method 'GET' -Api $Api
+    foreach ($entity in $response.entities) {
+        [pscustomobject]@{
+            Name      = $entity.name
+            Kind      = $entity.kind
+            Documents = $entity.doc_count
+            Chunks    = $entity.chunks
+            Mentions  = $entity.mentions
+        }
+    }
+}
+
+function Get-RagNeighbor {
+    <#
+    .SYNOPSIS
+      What shares documents with a name, one or more hops out.
+    .DESCRIPTION
+      Each neighbour carries the passages the link rests on: an edge here is
+      never an assertion that two things are related, it is a citation you can
+      go and check.
+    .EXAMPLE
+      Get-RagNeighbor NW-2200 -Hops 2
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$Entity,
+        [ValidateRange(1, 3)][int]$Hops = 1,
+        [int]$Limit = 12,
+        [string]$Api
+    )
+
+    $response = Invoke-RagApi -Route '/graph/neighbors' -Api $Api -Body @{
+        entity = $Entity; hops = $Hops; limit = $Limit
+    }
+    foreach ($neighbour in $response.neighbors) {
+        [pscustomobject]@{
+            Name      = $neighbour.name
+            Kind      = $neighbour.kind
+            Hop       = $neighbour.hop
+            Shared    = $neighbour.shared_chunks
+            Documents = $neighbour.documents
+            Evidence  = @($neighbour.evidence | ForEach-Object { $_.citation })
+        }
+    }
+}
+
+function Get-RagPath {
+    <#
+    .SYNOPSIS
+      How two names connect, through the documents mentioning both.
+    .DESCRIPTION
+      Best-effort: the chain is only as good as the entity extraction, and on
+      prose it can route through a weak link. Read the evidence citations
+      before believing a hop.
+    .EXAMPLE
+      Get-RagPath -From 'Harborline' -To 'NW-9001'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$From,
+        [Parameter(Mandatory = $true, Position = 1)][string]$To,
+        [ValidateRange(1, 4)][int]$MaxHops = 3,
+        [string]$Api
+    )
+
+    $response = Invoke-RagApi -Route '/graph/path' -Api $Api -Body @{
+        from = $From; to = $To; max_hops = $MaxHops
+    }
+    if (-not $response.found) {
+        Write-Warning "no chain from '$From' to '$To': $($response.detail)"
+        return
+    }
+    foreach ($step in $response.steps) {
+        [pscustomobject]@{
+            From     = $step.from
+            To       = $step.to
+            Shared   = $step.shared_chunks
+            Evidence = @($step.evidence | ForEach-Object { $_.citation })
+        }
+    }
+}
+
 function Invoke-RagSearch {
     <#
     .SYNOPSIS
@@ -617,6 +731,8 @@ function Invoke-RagSearch {
         [switch]$Full,
         [switch]$NoRewrite,
         [switch]$NoProject,
+        [ValidateRange(0, 3)][int]$Hops = 0,
+        [switch]$NoHybrid,
         [string]$Api
     )
 
@@ -626,12 +742,18 @@ function Invoke-RagSearch {
     $body = @{ query = $plan.EffectiveQuery; top_k = $plan.TopK }
     if ($plan.Language)   { $body.language_filter = $plan.Language }
     if ($plan.PathPrefix) { $body.path_prefix = $plan.PathPrefix }
+    if ($PSBoundParameters.ContainsKey('Hops')) { $body.hops = $Hops }
+    if ($NoHybrid) { $body.hybrid = $false }
 
     $route = '/search'
     if ($Full) { $route = '/search/full' }
     $response = Invoke-RagApi -Route $route -Body $body -Api $Api
 
     foreach ($hit in $response.results) {
+        $origins = @()
+        if ($hit.PSObject.Properties.Name -contains 'origins' -and $hit.origins) {
+            $origins = @($hit.origins)
+        }
         [pscustomobject]@{
             Path      = $hit.path
             StartLine = $hit.start_line
@@ -639,6 +761,9 @@ function Invoke-RagSearch {
             Score     = $hit.score
             Language  = $hit.language
             Location  = $hit.location
+            # Which arms found it - vector, keyword, graph. Empty on a
+            # vector-only server, which is what the field means there.
+            Origins   = $origins
             Text      = $hit.text
         }
     }
@@ -884,6 +1009,8 @@ function Get-RagContext {
         [switch]$NoFallback,
         [switch]$NoRewrite,
         [switch]$NoProject,
+        [ValidateRange(0, 3)][int]$Hops = 0,
+        [switch]$NoHybrid,
         [string]$Api
     )
 
@@ -898,8 +1025,18 @@ function Get-RagContext {
     }
     if ($plan.Language)   { $body.language_filter = $plan.Language }
     if ($plan.PathPrefix) { $body.path_prefix = $plan.PathPrefix }
+    if ($PSBoundParameters.ContainsKey('Hops')) { $body.hops = $Hops }
+    if ($NoHybrid) { $body.hybrid = $false }
 
     $response = Invoke-RagApi -Route '/context' -Body $body -Api $Api
+
+    # Which arms the server used. Hoisted out of the fallback block because it
+    # is also reported to the caller, and Set-StrictMode makes a conditionally
+    # defined variable a runtime error rather than an empty one.
+    $ranking = @()
+    if ($response.PSObject.Properties.Name -contains 'ranking' -and $response.ranking) {
+        $ranking = @($response.ranking)
+    }
 
     $sourceIndex = @{}
     foreach ($source in $response.sources) { $sourceIndex[$source.citation] = $source }
@@ -940,12 +1077,13 @@ function Get-RagContext {
     if ($fallbackEnabled) {
         $needFallback = $response.chunks_used -eq 0
         if (-not $needFallback -and $response.sources) {
-            # A score threshold is only meaningful for cosine similarity. With
-            # the cross-encoder on, scores are unbounded logits and can be
-            # negative for a perfectly good hit, so weakness is not judged.
-            $health = $null
-            try { $health = Get-RagHealthCached -Api $Api } catch { $health = $null }
-            if ($health -and -not $health.rerank) {
+            # The score floor is only meaningful when the score IS a cosine
+            # similarity. Once the server fuses rankings the number is an RRF
+            # weight, and with the cross-encoder on it is an unbounded logit
+            # that goes negative for perfectly good hits - a fixed threshold
+            # against either would fire on every query.
+            $pureVector = ($ranking.Count -eq 1 -and $ranking[0] -eq 'vector')
+            if ($pureVector) {
                 $best = ($response.sources | Measure-Object -Property score -Maximum).Maximum
                 $floor = [double](Get-RagValue $fallbackConfig 'min_score' 0.35)
                 if ($best -lt $floor) {
@@ -953,6 +1091,12 @@ function Get-RagContext {
                     $needFallback = $true
                 }
             }
+        }
+        if ($needFallback -and ($ranking -contains 'keyword')) {
+            # The server already ran BM25 over the same corpus and still found
+            # nothing, so grep is a genuine last resort here rather than the
+            # keyword search the index was missing.
+            Write-Verbose 'server-side keyword search also came up empty'
         }
         if ($needFallback) {
             $pattern = ConvertTo-RagLiteralPattern -Query $Query
@@ -1014,6 +1158,9 @@ function Get-RagContext {
         ChunksDropped  = $assembled.Dropped + $budgetDropped
         Chars          = $assembled.Chars
         Fallback       = $fallback
+        # What produced the ordering, so .Sources[].score is interpretable.
+        Ranking        = $ranking
+        Graph          = $response.graph
         CachedAt       = $(if ($cacheUsed) { $cacheUsed.created } else { $null })
     }
 }
@@ -1166,15 +1313,31 @@ function Ask-Rag {
         [switch]$NoFallback,
         [switch]$NoRewrite,
         [switch]$NoProject,
+        [ValidateRange(0, 3)][int]$Hops = 0,
+        [switch]$NoHybrid,
         [switch]$Raw,
         [string]$OutFile,
         [string]$Api
     )
 
-    $context = Get-RagContext -Query $Question -Project $Project -Mode $Mode -TopK $TopK `
-        -MaxChars $MaxChars -Language $Language -PathPrefix $PathPrefix `
-        -UseCache:$UseCache -NoFallback:$NoFallback -NoRewrite:$NoRewrite `
-        -NoProject:$NoProject -Api $Api
+    $contextArgs = @{
+        Query      = $Question
+        Project    = $Project
+        Mode       = $Mode
+        TopK       = $TopK
+        MaxChars   = $MaxChars
+        Language   = $Language
+        PathPrefix = $PathPrefix
+        UseCache   = $UseCache
+        NoFallback = $NoFallback
+        NoRewrite  = $NoRewrite
+        NoProject  = $NoProject
+        NoHybrid   = $NoHybrid
+        Api        = $Api
+    }
+    # Passed only when asked for, so the server's own default decides otherwise.
+    if ($PSBoundParameters.ContainsKey('Hops')) { $contextArgs.Hops = $Hops }
+    $context = Get-RagContext @contextArgs
 
     if ($context.ChunksUsed -eq 0) {
         $scope = 'the whole corpus'
@@ -1203,6 +1366,8 @@ function Ask-Rag {
         ChunksDropped = $context.ChunksDropped
         Chars         = $context.Chars
         Fallback      = $context.Fallback
+        Ranking       = $context.Ranking
+        Graph         = $context.Graph
         CachedAt      = $context.CachedAt
     }
 }
@@ -1248,6 +1413,7 @@ Export-ModuleMember -Function @(
     'Ask-Rag', 'Ask-RagQuick', 'Ask-RagDeep',
     'Get-RagContext', 'Invoke-RagSearch', 'Find-RagLiteral',
     'Get-RagProject', 'Set-RagProject', 'Remove-RagProject', 'Get-RagPrefix',
+    'Get-RagEntity', 'Get-RagNeighbor', 'Get-RagPath',
     'ConvertTo-RagLiteralPattern',
     'Update-RagContextCache', 'Get-RagContextCache', 'Clear-RagContextCache',
     'Expand-RagQuery', 'Get-RagConfig', 'Get-RagConfigPath'

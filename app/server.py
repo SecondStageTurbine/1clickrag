@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from .config import CONFIG, corpus_warning
 from .embedder import make_embedder
+from .graph import open_graph
 from .ingest import run_ingest
 from .reranker import Reranker
 from .store import Store
@@ -53,6 +54,9 @@ reranker = (
     if CONFIG.rerank
     else None
 )
+# Keyword index + entity graph. None when disabled or unopenable, and every
+# use is guarded: this is an addition to vector search, never a dependency of it.
+graph = open_graph(CONFIG)
 
 STATE: dict = {
     "ingest_running": False,
@@ -68,6 +72,11 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=100)
     language_filter: str | None = None
     path_prefix: str | None = None
+    # None means "whatever the server is configured for". Both are no-ops when
+    # the sidecar is disabled or empty, so an existing caller's body still
+    # means exactly what it meant before.
+    hybrid: bool | None = None
+    hops: int | None = Field(default=None, ge=0, le=3)
 
 
 def _bootstrap() -> None:
@@ -164,6 +173,8 @@ def health():
         "rerank_model": CONFIG.rerank_model if reranker else None,
         "qdrant": qdrant_ok,
         "vector_store": "embedded" if store.embedded else "server",
+        "graph": bool(graph and graph.has_data()),
+        "hybrid": bool(graph and graph.has_data() and CONFIG.hybrid),
         "chunks": chunks,
         "model": CONFIG.embed_model,
         "collection": CONFIG.collection,
@@ -181,8 +192,15 @@ def health():
 
 @app.get("/stats")
 def stats():
+    graph_stats = None
+    if graph is not None:
+        try:
+            graph_stats = graph.stats()
+        except Exception as exc:  # a sidecar problem must not break /stats
+            graph_stats = {"error": str(exc)}
     return {
         "service": SERVICE_ID,
+        "graph": graph_stats,
         "repo": CONFIG.repo_label,
         "repo_path": CONFIG.repo_path,
         "mode": CONFIG.mode,
@@ -197,6 +215,41 @@ def stats():
         "uptime_seconds": round(time.time() - STATE["started_at"], 1),
         "error": STATE["ingest_error"],
     }
+
+
+def _citation_key(hit: dict) -> str:
+    return f"{hit['path']}:{hit['start_line']}-{hit['end_line']}"
+
+
+def _fuse(rankings: list[tuple[str, list[dict]]], k: int) -> list[dict]:
+    """Reciprocal rank fusion of several rankings of the same chunks.
+
+    Ranks are combined, not scores. A cosine similarity, a BM25 value and a
+    count of matched entities share no scale and no distribution; normalising
+    them against each other would invent a comparison that does not exist,
+    whereas "this arm put it third" is meaningful in every arm. A chunk found
+    by two arms outranks a chunk any one of them liked slightly more, which is
+    the property that makes hybrid retrieval work.
+    """
+    scores: dict[str, float] = {}
+    entries: dict[str, dict] = {}
+    origins: dict[str, list[str]] = {}
+
+    for name, hits in rankings:
+        for rank, hit in enumerate(hits, start=1):
+            key = _citation_key(hit)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+            origins.setdefault(key, []).append(name)
+            if key not in entries:
+                entries[key] = hit
+
+    fused = []
+    for key in sorted(scores, key=lambda item: -scores[item]):
+        entry = dict(entries[key])
+        entry["score"] = round(scores[key], 6)
+        entry["origins"] = origins[key]
+        fused.append(entry)
+    return fused
 
 
 def _do_search(request: SearchRequest, truncate: bool) -> JSONResponse:
@@ -227,8 +280,66 @@ def _do_search(request: SearchRequest, truncate: bool) -> JSONResponse:
         language_filter=request.language_filter,
         path_prefix=request.path_prefix,
     )
+
+    rankings: list[tuple[str, list[dict]]] = [("vector", hits)]
+    graph_used: dict | None = None
+    use_hybrid = CONFIG.hybrid if request.hybrid is None else request.hybrid
+    hops = CONFIG.graph_hops if request.hops is None else request.hops
+
+    if graph is not None and graph.has_data():
+        if use_hybrid:
+            rankings.append(
+                (
+                    "keyword",
+                    graph.keyword_search(
+                        request.query,
+                        top_k=wanted,
+                        language_filter=request.language_filter,
+                        path_prefix=request.path_prefix,
+                    ),
+                )
+            )
+        if hops > 0:
+            # Multi-hop: resolve the names in the question to entities, walk
+            # out `hops` steps, and add every chunk mentioning anything reached.
+            # This arm is recall, deliberately wide - the fusion and the
+            # reranker are what keep the width from becoming noise.
+            seeds = graph.resolve_entities(request.query)
+            reached = graph.expand(
+                [seed["id"] for seed in seeds], hops, CONFIG.graph_fanout
+            )
+            rankings.append(
+                (
+                    "graph",
+                    graph.chunks_for_entities(
+                        [entity["id"] for entity in reached],
+                        top_k=wanted,
+                        language_filter=request.language_filter,
+                        path_prefix=request.path_prefix,
+                    ),
+                )
+            )
+            graph_used = {
+                "hops": hops,
+                "seeds": [
+                    {"name": seed["name"], "kind": seed["kind"]} for seed in seeds
+                ],
+                "reached": [
+                    {"name": entity["name"], "hop": entity["hop"]}
+                    for entity in reached
+                    if entity["hop"] > 0
+                ][:20],
+            }
+
+    # One arm and no reranker is the original path, byte for byte: the score
+    # stays the cosine similarity a caller may already be reading.
+    if len(rankings) > 1:
+        hits = _fuse(rankings, CONFIG.rrf_k)
+
     if reranker:
         hits = reranker.rerank(request.query, hits, request.top_k)
+    else:
+        hits = hits[: request.top_k]
 
     results = []
     for hit in hits:
@@ -240,9 +351,18 @@ def _do_search(request: SearchRequest, truncate: bool) -> JSONResponse:
         entry["location"] = f"{hit['path']}:{hit['start_line']}"
         results.append(entry)
 
-    return JSONResponse(
-        content={"query": request.query, "count": len(results), "results": results}
-    )
+    payload = {
+        "query": request.query,
+        "count": len(results),
+        # What produced the ordering, so `score` is interpretable: a cosine
+        # similarity, a fused rank, and a cross-encoder logit are different
+        # numbers and only the caller can know which one it is looking at.
+        "ranking": [name for name, _ in rankings] + (["rerank"] if reranker else []),
+        "results": results,
+    }
+    if graph_used:
+        payload["graph"] = graph_used
+    return JSONResponse(content=payload)
 
 
 @app.post("/search")
@@ -260,6 +380,8 @@ class ContextRequest(BaseModel):
     top_k: int = Field(default=8, ge=1, le=50)
     language_filter: str | None = None
     path_prefix: str | None = None
+    hybrid: bool | None = None
+    hops: int | None = Field(default=None, ge=0, le=3)
     # Character budget for the assembled block. Whole chunks are dropped from
     # the bottom to fit; a chunk is never cut in half, because a generator
     # handed a sentence that stops mid-clause will finish it from imagination.
@@ -281,13 +403,16 @@ def context(request: ContextRequest):
             top_k=request.top_k,
             language_filter=request.language_filter,
             path_prefix=request.path_prefix,
+            hybrid=request.hybrid,
+            hops=request.hops,
         ),
         truncate=False,
     )
     if found.status_code != 200:
         return found
 
-    hits = json.loads(bytes(found.body)).get("results", [])
+    body = json.loads(bytes(found.body))
+    hits = body.get("results", [])
 
     blocks: list[str] = []
     sources: list[dict] = []
@@ -316,12 +441,131 @@ def context(request: ContextRequest):
         "query": request.query,
         "context": "\n\n".join(blocks),
         "sources": sources,
+        "ranking": body.get("ranking", []),
+        "graph": body.get("graph"),
         "chunks_used": len(blocks),
         # Reported rather than silent: a caller that always wanted 8 chunks
         # should be able to see that it got 5 and why.
         "chunks_dropped_for_budget": dropped,
         "chars": used,
     }
+
+
+class NeighbourRequest(BaseModel):
+    entity: str
+    hops: int = Field(default=1, ge=1, le=3)
+    limit: int = Field(default=12, ge=1, le=100)
+
+
+class PathRequest(BaseModel):
+    # `from` is a Python keyword, so the field is aliased for the JSON body.
+    start: str = Field(alias="from")
+    end: str = Field(alias="to")
+    max_hops: int = Field(default=3, ge=1, le=4)
+
+    model_config = {"populate_by_name": True}
+
+
+def _require_graph() -> JSONResponse | None:
+    if graph is None:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "error": "the entity graph is disabled",
+                "detail": "set RAG_GRAPH=1 and reindex to build it",
+            },
+        )
+    if not graph.has_data():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "the entity graph is empty",
+                "detail": "it is built during ingest - run a full reindex to populate it",
+            },
+        )
+    return None
+
+
+@app.get("/entities")
+def entities(
+    limit: int = 50,
+    kind: str | None = None,
+    contains: str | None = None,
+    path_prefix: str | None = None,
+    include_common: bool = False,
+):
+    """The names the index knows about, most-mentioned first.
+
+    Boilerplate is hidden by default - anything appearing in more than
+    RAG_GRAPH_MAX_DF of the documents connects everything to everything. Pass
+    include_common=true to see what is being filtered and why.
+    """
+    problem = _require_graph()
+    if problem:
+        return problem
+    return {
+        "count": graph.count_chunks(),
+        "df_ceiling": graph.df_ceiling(),
+        "entities": graph.top_entities(
+            limit=min(max(limit, 1), 500),
+            kind=kind,
+            contains=contains,
+            path_prefix=path_prefix,
+            include_common=include_common,
+        ),
+    }
+
+
+@app.post("/graph/neighbors")
+def neighbours(request: NeighbourRequest):
+    """What shares documents with this name, one or more hops out."""
+    problem = _require_graph()
+    if problem:
+        return problem
+
+    seeds = graph.resolve_entities(request.entity, limit=3)
+    if not seeds:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": f"no entity matching '{request.entity}'",
+                "detail": "GET /entities?contains=... to see what is indexed",
+            },
+        )
+
+    reached = graph.expand(
+        [seed["id"] for seed in seeds], request.hops, CONFIG.graph_fanout
+    )
+    return {
+        "entity": seeds[0]["name"],
+        "matched": [{"name": seed["name"], "kind": seed["kind"]} for seed in seeds],
+        "hops": request.hops,
+        "neighbors": [
+            {
+                "name": entity["name"],
+                "kind": entity["kind"],
+                "hop": entity["hop"],
+                "shared_chunks": entity.get("shared"),
+                "documents": entity["doc_count"],
+                # The passages the link rests on. An edge here is never an
+                # assertion - it is these citations, and they can be checked.
+                "evidence": graph.link(seeds[0]["id"], entity["id"])
+                if entity["hop"] == 1
+                else [],
+            }
+            for entity in reached
+            if entity["hop"] > 0
+        ][: request.limit],
+    }
+
+
+@app.post("/graph/path")
+def graph_path(request: PathRequest):
+    """How two names connect, through the documents that mention both."""
+    problem = _require_graph()
+    if problem:
+        return problem
+    return graph.path_between(request.start, request.end, max_hops=request.max_hops)
 
 
 class ReindexRequest(BaseModel):
