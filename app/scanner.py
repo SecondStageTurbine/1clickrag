@@ -136,15 +136,28 @@ def unsupported_counts(cfg: Config) -> dict[str, int]:
 def read_text(abs_path: str, max_bytes: int) -> str | None:
     """Read a file as text, or None if it is missing, binary, or oversized.
 
-    Document formats (PDF, Word, slides, spreadsheets) are binary and are
-    handled by ``load_text`` below, which routes them through app.extract.
+    Raises OSError if the file is there but cannot be read - locked by the
+    application still writing it, or on a share that just dropped. That is a
+    different thing from "nothing to index here", and the difference decides
+    whether the work queue retries it or forgets it: returning None for both
+    is how a document saved from Word ends up permanently missing from the
+    index, because the read happened while Word still held the handle.
     """
     try:
-        if os.path.getsize(abs_path) > max_bytes:
-            return None
+        size = os.path.getsize(abs_path)
+    except OSError:
+        return None  # vanished between the walk and the read
+
+    if size > max_bytes:
+        return None
+    try:
         with open(abs_path, "rb") as handle:
             raw = handle.read()
+    except FileNotFoundError:
+        return None
     except OSError:
+        if os.path.exists(abs_path):
+            raise
         return None
     if b"\x00" in raw[:4096]:
         return None

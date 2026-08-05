@@ -37,7 +37,7 @@ from .entities import extract_entities, normalise_key
 
 log = logging.getLogger("rag.graph")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Bare words for the MATCH expression. Everything else is punctuation as far as
 # the unicode61 tokenizer is concerned, so a query keeps only what can match.
@@ -101,6 +101,7 @@ class Graph:
                     source     TEXT    NOT NULL,
                     language   TEXT    NOT NULL DEFAULT '',
                     symbol     TEXT    NOT NULL DEFAULT '',
+                    section    TEXT    NOT NULL DEFAULT '',
                     start_line INTEGER NOT NULL DEFAULT 0,
                     end_line   INTEGER NOT NULL DEFAULT 0
                 );
@@ -222,13 +223,14 @@ class Graph:
 
             for chunk in chunks:
                 cursor = self.db.execute(
-                    "INSERT INTO chunks(path, source, language, symbol, start_line, end_line)"
-                    " VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO chunks(path, source, language, symbol, section,"
+                    " start_line, end_line) VALUES (?,?,?,?,?,?,?)",
                     (
                         chunk.path,
                         chunk.source or chunk.path,
                         chunk.language,
                         chunk.symbol,
+                        chunk.section,
                         chunk.start_line,
                         chunk.end_line,
                     ),
@@ -370,7 +372,7 @@ class Graph:
             return []
 
         sql = [
-            "SELECT c.id, c.path, c.language, c.symbol, c.start_line, c.end_line,",
+            "SELECT c.id, c.path, c.language, c.symbol, c.section, c.start_line, c.end_line,",
             "       chunk_fts.text AS text, bm25(chunk_fts) AS rank",
             "  FROM chunk_fts JOIN chunks c ON c.id = chunk_fts.rowid",
             " WHERE chunk_fts MATCH ?",
@@ -398,6 +400,7 @@ class Graph:
                     "start_line": row["start_line"],
                     "end_line": row["end_line"],
                     "symbol": row["symbol"],
+                    "section": row["section"],
                     # bm25() is negative with better matches more negative;
                     # flipped so "higher is better" holds everywhere.
                     "score": round(-float(row["rank"]), 6),
@@ -592,7 +595,7 @@ class Graph:
             return []
         placeholders = ",".join("?" * len(entity_ids))
         sql = [
-            "SELECT c.id, c.path, c.language, c.symbol, c.start_line, c.end_line,",
+            "SELECT c.id, c.path, c.language, c.symbol, c.section, c.start_line, c.end_line,",
             "       f.text AS text,",
             "       COUNT(DISTINCT m.entity_id) AS matched, SUM(m.count) AS mentions",
             "  FROM mentions m",
@@ -620,6 +623,7 @@ class Graph:
                     "start_line": row["start_line"],
                     "end_line": row["end_line"],
                     "symbol": row["symbol"],
+                    "section": row["section"],
                     "score": float(row["matched"]),
                     "text": row["text"],
                     "entities_matched": int(row["matched"]),

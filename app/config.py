@@ -323,6 +323,25 @@ class Config:
     # is what makes a network share stay current despite SMB not delivering
     # change notifications.
     rescan_minutes: int = _env_int("RAG_RESCAN_MINUTES", -1)
+
+    # Durable work queue. Changes seen by the watcher are recorded here before
+    # being indexed, so a file that is still being written - or a process that
+    # dies mid-embed - costs a retry rather than a permanently stale index.
+    queue_path: str = os.environ.get(
+        "RAG_QUEUE_PATH", os.path.join(_DEFAULT_DATA, "ingest-queue.db")
+    )
+    # Attempts before an item is parked in the dead-letter table, where it
+    # stops burning retries and starts being evidence (GET /queue).
+    queue_max_attempts: int = _env_int("RAG_QUEUE_MAX_ATTEMPTS", 5)
+    # How many paths one worker pass takes on. Batching amortises the setup
+    # each ingest does; too large and one bad file delays the rest.
+    queue_batch: int = _env_int("RAG_QUEUE_BATCH", 25)
+    queue_poll_seconds: float = float(os.environ.get("RAG_QUEUE_POLL", "2.0"))
+
+    # Expand a retrieved chunk to the rest of its section before handing it to
+    # a generator. A chunk is a retrieval unit, not a unit of meaning: the
+    # paragraph that matched is often the middle of the argument.
+    context_expand: bool = _env_bool("RAG_CONTEXT_EXPAND", True)
     # Watching defaults OFF for a UNC share. SMB does not deliver change
     # notifications dependably, so the watcher would appear to work while
     # quietly missing edits - worse than not running, because the index looks

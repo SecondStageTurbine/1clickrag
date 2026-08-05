@@ -904,11 +904,19 @@ function Split-RagContextBlock {
     param([string]$Context)
 
     if (-not $Context) { return @() }
-    $matches = [regex]::Matches($Context, '(?ms)^\[(\d+)\]\s+(\S+)\r?\n(.*?)(?=\r?\n\r?\n\[\d+\]\s+\S+\r?\n|\z)')
+    # The citation may be followed by the section heading on the same line, so
+    # the pattern has to tolerate a trailing remainder - without it, every
+    # block from a server that labels its citations parses as zero blocks and
+    # -UseCache silently contributes nothing.
+    $matches = [regex]::Matches($Context, '(?ms)^\[(\d+)\]\s+(\S+)([^\r\n]*)\r?\n(.*?)(?=\r?\n\r?\n\[\d+\]\s+\S+[^\r\n]*\r?\n|\z)')
     return @(foreach ($match in $matches) {
         [pscustomobject]@{
             Citation = $match.Groups[2].Value
-            Text     = $match.Groups[3].Value.TrimEnd()
+            # Whatever the server put after the citation - the section heading.
+            # Captured and carried so re-numbering does not throw away the one
+            # part of the line that says where in the document this sits.
+            Label    = $match.Groups[3].Value.TrimEnd()
+            Text     = $match.Groups[4].Value.TrimEnd()
         }
     })
 }
@@ -951,7 +959,9 @@ function Join-RagContextBlock {
 
     foreach ($block in $Blocks) {
         $number++
-        $text = "[$number] $($block.Citation)`n$($block.Text)"
+        $label = ''
+        if ($block.PSObject.Properties.Name -contains 'Label' -and $block.Label) { $label = $block.Label }
+        $text = "[$number] $($block.Citation)$label`n$($block.Text)"
         if ($used + $text.Length -gt $MaxChars -and $rendered.Count -gt 0) {
             $dropped = $Blocks.Count - $rendered.Count
             break
@@ -1053,6 +1063,7 @@ function Get-RagContext {
                 foreach ($block in (Split-RagContextBlock $cached.context)) {
                     $cacheBlocks += [pscustomobject]@{
                         Citation = $block.Citation
+                        Label    = $block.Label
                         Text     = $block.Text
                         Origin   = 'cache'
                     }
@@ -1064,6 +1075,7 @@ function Get-RagContext {
     $freshBlocks = @(foreach ($block in (Split-RagContextBlock $response.context)) {
         [pscustomobject]@{
             Citation = $block.Citation
+            Label    = $block.Label
             Text     = $block.Text
             Origin   = 'search'
         }
@@ -1111,6 +1123,7 @@ function Get-RagContext {
             foreach ($line in $fallback) {
                 $freshBlocks += [pscustomobject]@{
                     Citation = "$($line.Path):$($line.Line)"
+                    Label    = ''
                     Text     = $line.Text
                     Origin   = 'grep'
                 }
