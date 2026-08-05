@@ -2,9 +2,9 @@
 # One-command local RAG
 
 Point it at a folder of documents and get a private, searchable index of them,
-running entirely on your machine. Vector store, embedding model, indexer, HTTP
-API and a browser UI - one command, no accounts, no API keys, no cloud, nothing
-leaves the box.
+running entirely on your machine. Vector store, embedding model, keyword index,
+entity graph, indexer, HTTP API and a browser UI - one command, no accounts, no
+API keys, no cloud, nothing leaves the box.
 
 **Windows: double-click `Rag.bat`.** It asks which folder of documents to make
 searchable, then does everything else. That is the whole setup.
@@ -31,6 +31,23 @@ machine without changing anything on it.
 **The only prerequisite is Python 3.10+.** No Docker, no database server, no
 model daemon - the whole stack is one Python process. The script checks for
 Python and tells you exactly what to do if it is missing.
+
+## What you get
+
+| | What it does |
+| --- | --- |
+| **Semantic search** | ask in plain language; finds the passage, not the keyword — [tuning](#if-results-look-wrong) |
+| **Exact search, fused in** | ticket IDs, part numbers, error codes — the strings embeddings are worst at — [how](#keyword-search-and-the-entity-graph) |
+| **Multi-hop** | follow a name from one document to the others mentioning it — [how](#keyword-search-and-the-entity-graph) |
+| **Reads almost anything** | PDF, Word, Excel, PowerPoint, email, HTML, code, and inside `.zip` — [formats](#what-it-can-read) |
+| **Stays current** | a watcher for live edits, a reconcile for whatever changed while it was off — [how](#keeping-it-running-and-keeping-it-current) |
+| **Stays running** | one command registers it to start at logon and revive itself — [autostart](#autostart) |
+| **Cited answers** | `/context` returns numbered, quotable passages for an LLM to answer from — [the "G" in RAG](#feeding-an-llm-the-g-in-rag) |
+| **A shell client** | project-scoped questions, two query modes, one standard prompt — [PowerShell client](#the-powershell-client-rag-clientpsm1) |
+| **Travels offline** | one zip carries the code, the wheels and the models to an air-gapped PC — [taking it elsewhere](#taking-it-to-another-pc) |
+
+It runs no language model and needs none installed. It finds and cites the
+passages; whatever writes prose from them is your choice and lives outside this.
 
 ## What it can read
 
@@ -100,6 +117,11 @@ one:
 - **Embeddings** - `fastembed` runs the model in-process through ONNX. Weights
   are downloaded once into `.data/models` and reused offline afterwards.
 
+The keyword index and entity graph that came later kept the same rule: they are
+one SQLite file (`.data/graph.db`) built on `sqlite3` and FTS5 from the standard
+library, so they add no dependency, no daemon, and nothing to an offline
+install.
+
 So `rag-up` creates a virtualenv, installs dependencies, indexes the folder, and
 serves. That is the entire install.
 
@@ -109,9 +131,14 @@ serves. That is the entire install.
    afterwards it reinstalls only when `requirements*.txt` actually change.
 2. Downloads the embedding model (`nomic-embed-text-v1.5`, ~520 MB) into
    `.data/models` — **first run only**; later starts are fully offline.
-3. Walks the repository, chunks it, embeds it, and writes the vector index.
+3. Walks the folder, chunks it, embeds it, and writes the vector index — plus
+   the keyword index and the entity graph, in the same pass.
 4. Starts a filesystem watcher so edits re-index automatically (2 s debounce).
 5. Waits until `/health` reports `healthy`, prints the URL, and opens the UI.
+
+On every later start it also reconciles the index against the folder, so
+anything added, edited or deleted while it was off is picked up. Unchanged files
+are skipped on modification time, so that costs a directory walk, not a re-embed.
 
 First run takes a few minutes (dependency install + model download + full
 ingest). Every later `rag-up` is seconds — the index and the model are on disk
@@ -119,8 +146,9 @@ and are reused.
 
 ## Using it
 
-**Browser** — <http://127.0.0.1:49404>. Query box, language filter, path-prefix
-filter, live index status, and a re-index button.
+**Browser** — <http://127.0.0.1:49404>. Query box, language and path-prefix
+filters, a keyword toggle, a hops selector with a when-to-use guide, live index
+status, and a re-index button. Results show which arms found them.
 
 **Shell**
 
@@ -284,16 +312,29 @@ embedding model into `.data\models\`. Then package it as a single file:
 .\rag-up.ps1 package
 ```
 
-That writes `rag-portable.zip` (~600 MB) beside the folder, excluding `.venv`
-(machine-specific, rebuilt on arrival) and `.data\qdrant` (the index of *this*
-machine's corpus - so the zip does not carry a verbatim copy of local documents
-somewhere they should not go). Copy the zip, unzip it on the other PC, and run
-`.\rag-up.ps1 -Folder "..."`.
+That writes `rag-portable.zip` (~780 MB) beside the folder. Copy it, unzip on
+the other PC, and run `Rag.bat`.
+
+Left out on purpose:
+
+| Excluded | Why |
+| --- | --- |
+| `.venv` | records absolute paths to the Python that built it; rebuilt on arrival |
+| `.data\qdrant` | the index of *this* machine's corpus |
+| `.data\graph.db` | the same documents again — FTS5 stores a verbatim copy of everything it indexes |
+| `.data\context-cache` | cached passages, also verbatim document text |
+| `.git` | a tool being delivered, not a checkout being cloned |
+| `rag.pid`, `rag.log` | describe a run on the machine that built the package |
+
+The corpus path is stripped from the packaged `.env` too, so the target asks for
+its own folder instead of pointing at a path that does not exist there. Between
+them, that is what lets you hand someone the zip without handing them your
+documents.
 
 If you would rather copy the folder directly:
 
 ```powershell
-robocopy . D:\rag /E /XD .venv .data\qdrant
+robocopy . D:\rag /E /XD .venv .data\qdrant .data\context-cache /XF graph.db* rag.pid rag.log*
 ```
 
 **Match the Python minor version.** Binary wheels (onnxruntime, numpy,
@@ -306,9 +347,14 @@ target's before travelling:
 .\rag-up.ps1 bundle -ForPython '3.12,3.13'
 ```
 
-On the other PC, edit `.env` so `RAG_REPO_MOUNT` points at wherever the repo
-lives there, then `.\rag-up.ps1`. It installs from the vendored wheels
+On the other PC, run `Rag.bat` and answer the folder question (or set
+`RAG_REPO_MOUNT` in `.env` yourself). It installs from the vendored wheels
 (`--no-index`) and loads the bundled model, so it never reaches the network.
+Then, if it should stay up on its own:
+
+```powershell
+.\rag-up.ps1 autostart
+```
 
 ### What to copy, and what not to
 
@@ -316,9 +362,10 @@ lives there, then `.\rag-up.ps1`. It installs from the vendored wheels
 | --- | --- | --- |
 | `app/`, `*.ps1`, `*.sh`, `requirements*.txt` | **yes** | the program |
 | `.env` | **yes**, then edit | `RAG_REPO_MOUNT` differs per machine |
+| `rag-client.psm1`, `rag-projects.example.json` | **yes** | the PowerShell client and its config template |
 | `vendor/wheels/` | yes, for an offline target | dependencies without PyPI |
-| `.data/models/` | yes, for an offline target | ~520 MB, avoids huggingface.co |
-| `.data/qdrant/` | optional | a prebuilt index — skips the first ingest |
+| `.data/models/` | yes, for an offline target | ~610 MB, avoids huggingface.co |
+| `.data/qdrant/`, `.data/graph.db` | optional, and only to a machine allowed to hold the documents | a prebuilt index — skips the first ingest, but both contain the corpus |
 | `.venv/` | **no** | records absolute paths to the Python that built it |
 
 `.venv` is the one that bites: copied across, it looks present and fails in
@@ -777,7 +824,11 @@ include/exclude rules before a long first ingest.
 | First run looks stuck | It is installing deps or downloading the model. `.\rag-up.ps1 logs`. |
 | `status: empty` | Ingest found nothing. Check `RAG_REPO_MOUNT`, then `.\rag-up.ps1 reindex`. |
 | Port 49404 in use | Another RAG is running (`.\rag-up.ps1 down`), or set `RAG_PORT`. |
-| Results feel stale | The watcher may be off on some filesystems — `.\rag-up.ps1 reindex`. |
+| Results feel stale | The watcher is off on UNC shares by default. Restarting reconciles; otherwise set `RAG_RESCAN_MINUTES=15`, or run `.\rag-up.ps1 reindex` (which now only re-embeds what changed). |
+| Nothing is running after a reboot | Nothing starts it unless you asked: `.\rag-up.ps1 autostart`. |
+| An exact ID or part number is not found | The keyword index is built during ingest. On an index predating it, `.\rag-up.ps1 reindex -Full`. Check `/health` shows `"graph": true`. |
+| `hops` reaches nothing | The names in the question matched no indexed entity, or they are above the boilerplate ceiling. `GET /entities?include_common=true` shows both, and `RAG_GRAPH_MAX_DF` raises the ceiling — the default is too strict for a single-subject corpus. |
+| Offline install fails on the target | Its Python minor version has no wheels in the bundle. It ships cp311–cp314; add others with `.\rag-up.ps1 bundle -ForPython '3.10'` before travelling. |
 | `python -m app.ingest` fails with a lock error | The server holds the embedded store. Re-index through it: `.\rag-up.ps1 reindex`. |
 | Want better code recall | `RAG_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code` in `.env`, then `.\rag-up.ps1 reindex -Full`. |
 | Want a smaller/faster model | `RAG_EMBED_MODEL=BAAI/bge-small-en-v1.5` (~67 MB, 384-dim), then reindex `-Full`. |
