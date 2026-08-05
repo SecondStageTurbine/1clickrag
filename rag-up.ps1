@@ -329,6 +329,69 @@ function Initialize-Venv {
     }
 }
 
+function Invoke-Pip {
+    # pip reports ordinary things on stderr - a yanked version, a resolver note -
+    # and this script runs with $ErrorActionPreference = 'Stop', which turns any
+    # native stderr output into a terminating NativeCommandError. Without this,
+    # one informational line aborts a bundle halfway through.
+    param([string[]]$PipArgs)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $VenvPy -m pip @PipArgs 2>&1
+        return [pscustomobject]@{ Ok = ($LASTEXITCODE -eq 0); Output = $output }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
+# Would an offline install actually succeed on each target interpreter?
+#
+# Counting wheels is not an answer: the set that broke a work PC had a wheel for
+# every package and still could not resolve, because two of them pinned each
+# other to versions that were never fetched together. The only honest check is
+# to ask pip to resolve the requirements against nothing but vendor\wheels, for
+# that Python, which is exactly what the target will do - and to do it here,
+# where there is still a network to fix it with.
+function Test-BundleResolves {
+    param([string]$Versions)
+
+    $targets = @()
+    if ($Versions) { $targets += ($Versions -split ',' | Where-Object { $_ } | ForEach-Object { $_.Trim() }) }
+    $here = & $VenvPy -c "import sys; print('%d.%d' % sys.version_info[:2])"
+    if ($targets -notcontains $here) { $targets = @($here) + $targets }
+
+    Write-Host ''
+    Write-Host '==> checking the bundle installs offline' -ForegroundColor Cyan
+    $failed = @()
+    foreach ($version in $targets) {
+        $probe = Join-Path ([System.IO.Path]::GetTempPath()) ('rag-probe-' + [guid]::NewGuid().ToString('N'))
+        $result = Invoke-Pip @(
+            'download', '--no-index', '--find-links', $Wheels, '--only-binary=:all:',
+            '--python-version', $version, '--platform', 'win_amd64',
+            '-r', (Join-Path $PSScriptRoot 'requirements-native.txt'), '-d', $probe
+        )
+        $ok = $result.Ok
+        $output = $result.Output
+        Remove-Item $probe -Recurse -Force -ErrorAction SilentlyContinue
+        if ($ok) {
+            Write-Host "    Python $version : OK" -ForegroundColor Green
+        } else {
+            $failed += $version
+            Write-Host "    Python $version : FAILS" -ForegroundColor Red
+            $reason = $output | Where-Object { $_ -match 'Could not find|No matching distribution' } |
+                Select-Object -First 2
+            foreach ($line in $reason) { Write-Host "      $line" -ForegroundColor Yellow }
+        }
+    }
+    if ($failed) {
+        Write-Host ''
+        Write-Host "    Add the missing wheels before travelling:" -ForegroundColor Yellow
+        Write-Host "        .\rag-up.ps1 bundle -ForPython '$($failed -join ',')'"
+    }
+}
+
 # Prepare this folder to be carried to a machine with no internet access:
 # vendor the wheels and pre-download the model, so rag-up there needs neither
 # PyPI nor huggingface.co.
@@ -355,18 +418,33 @@ function New-Bundle {
     # already portable across versions. Fetching per-distribution also sidesteps
     # a whole-file resolve, which cannot succeed under the --only-binary that
     # --python-version forces: this set contains an sdist-only dependency.
+    # Name AND version, not just the name. Fetching by name alone takes whatever
+    # is newest, which quietly produces a bundle that cannot install: pydantic
+    # pins pydantic-core exactly, so a set holding pydantic-core 2.46.4 for the
+    # interpreter that built it and 2.47.0 for every other one resolves on
+    # exactly one machine and fails on the rest, at install time, offline,
+    # where there is no network to recover with.
     $specific = Get-ChildItem $Wheels -Filter *.whl |
         Where-Object { $_.Name -match '-cp\d+-cp\d+' } |
-        ForEach-Object { ($_.Name -split '-')[0] } |
-        Sort-Object -Unique
+        ForEach-Object {
+            $parts = $_.Name -split '-'
+            [pscustomobject]@{ Name = $parts[0]; Version = $parts[1] }
+        } | Sort-Object Name, Version -Unique
 
     foreach ($version in ($ForPython -split ',' | Where-Object { $_ })) {
         $version = $version.Trim()
         Write-Host "==> also fetching binary wheels for Python $version" -ForegroundColor Cyan
         $before = (Get-ChildItem $Wheels -Filter *.whl).Count
         foreach ($dist in $specific) {
-            & $VenvPy -m pip download --quiet --only-binary=:all: --no-deps `
-                --python-version $version --platform win_amd64 $dist -d $Wheels 2>$null
+            $common = @('download', '--quiet', '--only-binary=:all:', '--no-deps',
+                        '--python-version', $version, '--platform', 'win_amd64', '-d', $Wheels)
+            $result = Invoke-Pip ($common + @("$($dist.Name)==$($dist.Version)"))
+            if (-not $result.Ok) {
+                # That exact version may have no wheel for an older interpreter
+                # (numpy drops a Python version while the pinned one is newer).
+                # Unpinned is right for anything nothing else pins exactly.
+                $null = Invoke-Pip ($common + @($dist.Name))
+            }
         }
         $added = (Get-ChildItem $Wheels -Filter *.whl).Count - $before
         Write-Host "    added $added wheel(s) for $version"
@@ -374,6 +452,8 @@ function New-Bundle {
             Write-Host '    (none resolved - that Python version may be too old for this set)' -ForegroundColor Yellow
         }
     }
+
+    Test-BundleResolves -Versions $ForPython
 
     Write-Host '==> pre-downloading the embedding model' -ForegroundColor Cyan
     $env:RAG_MODE = 'native'
