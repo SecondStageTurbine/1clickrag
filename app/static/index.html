@@ -70,6 +70,24 @@
     font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
   }
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  /* Set explicitly because the toggle below is display:inline-flex, which
+     would otherwise win over the attribute's default display:none. */
+  [hidden] { display: none !important; }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 11px; font-size: 13.5px; color: var(--muted); user-select: none;
+  }
+  .toggle input { margin: 0; accent-color: var(--accent); }
+  .meta {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px;
+    color: var(--muted); font-size: 12.5px; margin: 0 0 14px;
+  }
+  .tag {
+    font-family: var(--mono); font-size: 11.5px; background: var(--code-bg);
+    border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+  }
+  .result h2 .origins { font-family: var(--mono); font-size: 11px; font-weight: 400; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -103,13 +121,25 @@
     <select id="topk" title="Results">
       <option>5</option><option>10</option><option>20</option>
     </select>
+    <label class="toggle graph-only" id="hybrid-label" hidden
+           title="Fuse BM25 keyword search with the vector ranking. Finds exact strings — ticket IDs, part numbers — that mean nothing in embedding space.">
+      <input type="checkbox" id="hybrid" checked> keyword
+    </label>
+    <select id="hops" class="graph-only" hidden
+            title="Resolve the names in the question to entities, walk out through the documents they share, and add what that reaches as candidates.">
+      <option value="0">no hops</option>
+      <option value="1">1 hop</option>
+      <option value="2">2 hops</option>
+    </select>
     <button id="go" type="submit">Search</button>
   </form>
   <p class="hint">
-    Semantic search — best for “where is X done?”. For an exact symbol or string,
-    <code>grep</code> is still faster and more precise. Same index the API serves on
-    <code>POST /search</code> and <code>/search/full</code>.
+    Semantic search — best for “where is X done?”. With <b>keyword</b> on, exact
+    strings are found too, so <code>grep</code> is only needed for files outside the
+    index. <b>Hops</b> answers “what else is involved”, by walking the entity graph.
+    Same index the API serves on <code>POST /search</code> and <code>/search/full</code>.
   </p>
+  <div id="meta" class="meta" hidden></div>
   <div id="results"></div>
 </main>
 
@@ -126,6 +156,11 @@ async function refreshStatus() {
     if (h.error) text += ` · ${h.error}`;
     if (h.warning) text += ` · ⚠ ${h.warning}`;
     $('status-text').textContent = text;
+    // The graph controls only exist when the server has a sidecar to query.
+    // Showing them against a vector-only index would offer a setting that
+    // silently does nothing.
+    for (const el of document.querySelectorAll('.graph-only')) el.hidden = !h.graph;
+    if (!h.hybrid) $('hybrid').checked = false;
     return h;
   } catch (e) {
     dot.className = 'dot bad';
@@ -140,8 +175,37 @@ function escapeHtml(s) {
   ));
 }
 
+function renderMeta(data) {
+  const box = $('meta');
+  const bits = [];
+  // Which arms ran, so the score below is interpretable: a cosine similarity,
+  // a fused rank weight and a cross-encoder logit are different numbers.
+  if (data.ranking && data.ranking.length) {
+    bits.push(data.ranking.map((r) => `<span class="tag">${escapeHtml(r)}</span>`).join(' '));
+  }
+  if (data.graph) {
+    const seeds = (data.graph.seeds || []).map((s) => s.name);
+    const reached = (data.graph.reached || []).map((e) => e.name);
+    if (seeds.length) {
+      let line = `expanded from <b>${escapeHtml(seeds.join(', '))}</b>`;
+      if (reached.length) {
+        line += ` → ${escapeHtml(reached.slice(0, 10).join(', '))}`;
+        if (reached.length > 10) line += ` +${reached.length - 10} more`;
+      } else {
+        line += ' — nothing reached';
+      }
+      bits.push(line);
+    } else {
+      bits.push('no names in the question matched an indexed entity');
+    }
+  }
+  box.innerHTML = bits.join(' ');
+  box.hidden = !bits.length;
+}
+
 function render(data) {
   const box = $('results');
+  renderMeta(data);
   if (!data.results || !data.results.length) {
     box.innerHTML = '<div class="empty">No matches.</div>';
     return;
@@ -162,7 +226,9 @@ function render(data) {
     return `
     <div class="result">
       <h2><span>${escapeHtml(r.path)}:${r.start_line}–${r.end_line}</span>
-          <span class="score">${r.language} · ${r.score.toFixed(3)}</span></h2>
+          <span class="score">${(r.origins && r.origins.length)
+            ? `<span class="origins">${escapeHtml(r.origins.join('·'))}</span> · ` : ''
+          }${r.language} · ${Number(r.score).toFixed(3)}</span></h2>
       ${showSymbol ? `<div class="sym">${escapeHtml(r.symbol)}</div>` : ''}
       <pre>${escapeHtml(r.text)}</pre>
     </div>`;
@@ -174,6 +240,7 @@ $('form').addEventListener('submit', async (event) => {
   const query = $('q').value.trim();
   if (!query) return;
   $('go').disabled = true;
+  $('meta').hidden = true;
   $('results').innerHTML = '<div class="empty">Searching…</div>';
   try {
     const response = await fetch('/search/full', {
@@ -184,10 +251,13 @@ $('form').addEventListener('submit', async (event) => {
         top_k: parseInt($('topk').value, 10),
         language_filter: $('lang').value || null,
         path_prefix: $('prefix').value.trim() || null,
+        hybrid: $('hybrid').checked,
+        hops: parseInt($('hops').value, 10) || 0,
       }),
     });
     const data = await response.json();
     if (!response.ok) {
+      $('meta').hidden = true;
       $('results').innerHTML =
         `<div class="empty">${escapeHtml(data.error || 'search failed')} — ${escapeHtml(data.detail || '')}</div>`;
     } else {
