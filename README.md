@@ -128,7 +128,8 @@ filter, live index status, and a re-index button.
 .\rag-up.ps1 query "where is the IPC rendezvous done?"
 .\rag-up.ps1 ask "how does the boot handoff work?"   # the same hits as a ready prompt
 .\rag-up.ps1 status
-.\rag-up.ps1 reindex          # -Full to rebuild from scratch
+.\rag-up.ps1 autostart        # start at logon and stay up (-Remove to undo)
+.\rag-up.ps1 reindex          # only re-embeds what changed; -Full rebuilds
 .\rag-up.ps1 logs
 .\rag-up.ps1 down             # -Wipe also drops the index and model cache
 ```
@@ -169,6 +170,59 @@ ranking, default on), `hops` (graph expansion, default off).
 **Check `.status`, not `.ollama`.** Native mode has no Ollama, so `/health`
 reports `embeddings` and `embed_backend` instead; `ollama` appears only when
 that backend is actually in use.
+
+## Keeping it running, and keeping it current
+
+Three separate mechanisms, because no one of them covers everything:
+
+**The watcher** re-indexes a file seconds after it is saved, and drops it from
+both stores when it is deleted or moved away. It lives inside the server
+process, so it only runs while the server does.
+
+**The startup reconcile** catches everything the watcher could not see because
+nothing was running: files added, edited, renamed or deleted while the machine
+was off. It compares each file's modification time against what the index
+recorded, so unchanged files are skipped and a quiet corpus costs a directory
+walk and no embedding.
+
+**The periodic rescan** is the same sweep on a timer, for corpora where the
+watcher cannot be trusted. It defaults to every 15 minutes when watching is off
+(a UNC share) and off when the watcher is running; `RAG_RESCAN_MINUTES` sets it
+either way.
+
+That also makes an ordinary re-index cheap — it re-embeds only what changed:
+
+```
+ingest complete: 3 indexed, 79 unchanged, 1 removed, 9 skipped
+```
+
+### Autostart
+
+```powershell
+.\rag-up.ps1 -Folder "S:\Team\Documents"   # once, so the corpus is in .env
+.\rag-up.ps1 autostart                     # start at logon, stay up
+.\rag-up.ps1 autostart -Remove             # undo
+```
+
+This registers a Scheduled Task that starts the server at logon **and re-runs
+every 10 minutes**. The repeat is the point: a task that only fired at logon
+would leave a crashed server dead until the next reboot, whereas re-running the
+launcher costs nothing when the server is healthy — it prints one line and
+exits — and revives it when it is not. `-EveryMinutes` changes the interval.
+
+`autostart -System` runs it at boot as SYSTEM instead, so it comes up with no
+one logged in. That is genuine 24/7, with one catch worth understanding:
+**SYSTEM has no mapped drives and no share credentials**, so if your documents
+live on a network path it will index nothing. For a share, use the default
+per-user task, which runs as you.
+
+The task is refused if no corpus is recorded in `.env` — a scheduled run cannot
+see the environment of the shell you registered it from, so it would fail every
+ten minutes in a hidden window with nobody watching.
+
+**What still needs a hand:** a *directory* deleted wholesale is not always
+reported per-file by Windows, so its documents are pruned by the next reconcile
+rather than instantly. Startup and the periodic rescan both cover it.
 
 ## Pointing it at a different repository
 

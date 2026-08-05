@@ -312,6 +312,17 @@ class Config:
     snippet_chars: int = _env_int("RAG_SNIPPET_CHARS", 400)
 
     ingest_on_start: bool = _env_bool("RAG_INGEST_ON_START", True)
+    # Reconcile the index against the corpus at startup. The watcher only sees
+    # what happens while the process is alive, so without this every file added,
+    # edited or deleted while the server was stopped stays wrong until someone
+    # notices and reindexes by hand - and nobody notices, because a search that
+    # is missing a document looks exactly like a search with no answer.
+    reconcile_on_start: bool = _env_bool("RAG_RECONCILE_ON_START", True)
+    # Minutes between periodic reconciles. -1 picks a default from `watch`:
+    # off when the watcher is trusted, every 15 minutes when it is not, which
+    # is what makes a network share stay current despite SMB not delivering
+    # change notifications.
+    rescan_minutes: int = _env_int("RAG_RESCAN_MINUTES", -1)
     # Watching defaults OFF for a UNC share. SMB does not deliver change
     # notifications dependably, so the watcher would appear to work while
     # quietly missing edits - worse than not running, because the index looks
@@ -357,6 +368,13 @@ class Config:
     archives: bool = _env_bool("RAG_ARCHIVES", True)
     archive_max_bytes: int = _env_int("RAG_ARCHIVE_MAX_BYTES", 500_000_000)
     archive_max_members: int = _env_int("RAG_ARCHIVE_MAX_MEMBERS", 2000)
+
+
+    def __post_init__(self) -> None:
+        if self.rescan_minutes < 0:
+            # A watched local disk needs no polling; an unwatched share needs
+            # it to stay current at all.
+            self.rescan_minutes = 0 if self.watch else 15
 
 
 CONFIG = Config()

@@ -21,6 +21,7 @@
   .\rag-up.ps1 -Docker          # containerised stack instead
   .\rag-up.ps1 status           # health + index size
   .\rag-up.ps1 reindex          # incremental re-ingest  (-Full to rebuild)
+  .\rag-up.ps1 autostart        # start at logon and stay up  (-Remove to undo)
   .\rag-up.ps1 query "where is the IPC rendezvous done?"
   .\rag-up.ps1 ask "how is CHORD deployed?" -Project CHORD   # a prompt, ready for an LLM
   .\rag-up.ps1 bundle           # vendor wheels + model so it installs with no internet
@@ -32,7 +33,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('up', 'status', 'query', 'ask', 'reindex', 'bundle', 'package', 'logs', 'down')]
+    [ValidateSet('up', 'status', 'query', 'ask', 'reindex', 'autostart', 'bundle',
+                 'package', 'logs', 'down')]
     [string]$Command = 'up',
 
     [Parameter(Position = 1)]
@@ -53,6 +55,11 @@ param(
 
     [switch]$Docker,
     [switch]$Full,
+    # `autostart` only: -Remove unregisters it, -System runs at boot with no
+    # one logged in (needs admin), -EveryMinutes sets the keepalive interval.
+    [switch]$Remove,
+    [switch]$System,
+    [int]$EveryMinutes = 10,
     # `ask` only: deep-dive mode - a wider retrieval window for overviews.
     [switch]$Deep,
     # `ask` only: reuse the project's cached background context.
@@ -459,6 +466,111 @@ function New-Package {
     Write-Host '        .\rag-up.ps1 -Folder "S:\path\to\documents"'
 }
 
+$TaskName = 'LocalRAG'
+
+function Register-Autostart {
+    <#
+      Keeps the server - and therefore the watcher inside it - running without
+      anyone remembering to start it.
+
+      The trigger repeats every few minutes on purpose. Starting at logon alone
+      would leave a crashed server dead until the next reboot; re-running the
+      launcher instead makes the schedule its own keepalive, because a run that
+      finds the service healthy prints one line and exits. That is also why the
+      "already running" test above keys on /health rather than the pid file.
+    #>
+    param([switch]$AsSystem, [int]$EveryMinutes = 10)
+
+    # A scheduled run has none of this shell's environment, so a corpus set
+    # only in RAG_REPO_MOUNT here is invisible there: the task would fail every
+    # few minutes, silently, in a hidden window. .env is the one place both can
+    # see, so require it before promising the user this will keep running.
+    $corpus = $null
+    $envPath = Join-Path $PSScriptRoot '.env'
+    if (Test-Path $envPath) {
+        $match = Select-String -Path $envPath -Pattern '^\s*RAG_REPO_MOUNT\s*=\s*(.+)$' |
+            Select-Object -Last 1
+        if ($match) { $corpus = $match.Matches[0].Groups[1].Value.Trim() }
+    }
+    if (-not $corpus) {
+        Write-Host ''
+        Write-Host 'No corpus is recorded in rag\.env, so a scheduled run would have' -ForegroundColor Yellow
+        Write-Host 'nothing to index - it cannot see this shell environment.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Set it once, then register autostart:'
+        Write-Host '    .\rag-up.ps1 -Folder "S:\path\to\documents"'
+        Write-Host '    .\rag-up.ps1 autostart'
+        Write-Error 'no corpus in .env - autostart not registered.'
+        return
+    }
+
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+    $action = New-ScheduledTaskAction -Execute $psExe `
+        -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass ' +
+                   '-File "' + (Join-Path $PSScriptRoot 'rag-up.ps1') + '" -NoBrowser -NoPrompt') `
+        -WorkingDirectory $PSScriptRoot
+
+    if ($AsSystem) {
+        # True 24/7: runs at boot with no one logged in. Needs admin to
+        # register, and SYSTEM has no mapped drives and no share credentials -
+        # for a UNC corpus this will index nothing, which is why it is not the
+        # default.
+        $identity = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+    } else {
+        $identity = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    }
+
+    # Repetition is not exposed on AtLogOn/AtStartup triggers, so it is lifted
+    # off a throwaway -Once trigger. "Forever" is an ABSENT duration: the
+    # obvious [TimeSpan]::MaxValue serialises to P99999999DT23H59M59S, which
+    # Task Scheduler rejects outright as out of range.
+    $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes $EveryMinutes)
+    $trigger.Repetition = $repeat.Repetition
+    $trigger.Repetition.Duration = $null
+    $trigger.Repetition.StopAtDurationEnd = $false
+
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)
+    $settings.DisallowStartOnRemoteAppSession = $false
+    $settings.Hidden = $true
+
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $identity -Settings $settings `
+        -Description 'Local RAG: keeps the index server and its file watcher running.' | Out-Null
+
+    Write-Host "==> autostart registered as scheduled task '$TaskName'" -ForegroundColor Cyan
+    if ($AsSystem) {
+        Write-Host '    runs at boot as SYSTEM - no login needed.'
+        Write-Host '    NOTE: SYSTEM cannot see mapped drives or reach an SMB share as you.'
+        Write-Host '          If your documents live on a network share, re-register without'
+        Write-Host '          -System so it runs as you instead.' -ForegroundColor Yellow
+    } else {
+        Write-Host "    runs at your logon, as $env:USERNAME."
+    }
+    Write-Host "    re-checks every $EveryMinutes minute(s) and restarts the server if it died."
+    Write-Host '    remove it with:  .\rag-up.ps1 autostart -Remove'
+    Write-Host ''
+    Write-Host '    starting it now...'
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+
+function Unregister-Autostart {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        Write-Host "no scheduled task named '$TaskName' - nothing to remove."
+        return
+    }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Write-Host "==> autostart removed ('$TaskName')" -ForegroundColor Cyan
+    Write-Host '    the server keeps running until you stop it: .\rag-up.ps1 down'
+}
+
 function Get-RagProcess {
     if (-not (Test-Path $PidFile)) { return $null }
     $procId = (Get-Content $PidFile -Raw).Trim()
@@ -479,9 +591,16 @@ function Invoke-Compose {
 function Start-Native {
     New-Item -ItemType Directory -Force -Path $Data | Out-Null
 
+    # Keyed on the health check rather than the pid file, because the keepalive
+    # task re-runs this every few minutes and the pid file is the fragile half:
+    # lose it (a wiped .data, a server started by hand) and the old test would
+    # launch a second server, which then dies on the port or the storage lock
+    # and leaves a pid file pointing at a corpse. Answering /health as
+    # service=rag-local is proof enough that the job is already done.
     $existing = Get-RagProcess
-    if ($existing -and (Test-IsOurs (Get-Health))) {
-        Write-Host "already running (pid $($existing.Id)) - $Api" -ForegroundColor Green
+    if (Test-IsOurs (Get-Health)) {
+        $who = if ($existing) { "pid $($existing.Id)" } else { 'started elsewhere' }
+        Write-Host "already running ($who) - $Api" -ForegroundColor Green
         if (-not $NoBrowser) { Start-Process $Api }
         return
     }
@@ -605,6 +724,11 @@ switch ($Command) {
         # Written to the pipeline, not the host, so it can be redirected into a
         # file or piped straight to whatever runs the model.
         $answer.Prompt
+    }
+
+    'autostart' {
+        if ($Remove) { Unregister-Autostart }
+        else { Register-Autostart -AsSystem:$System -EveryMinutes $EveryMinutes }
     }
 
     'bundle' { New-Bundle }

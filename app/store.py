@@ -104,6 +104,42 @@ class Store:
         except Exception:
             return 0
 
+    def indexed_state(self) -> dict[str, dict]:
+        """Every indexed path with the source file and mtime it came from.
+
+        One scroll of the payloads, no vectors and no text, so this is cheap
+        enough to run on every startup - which is the point: it is the record
+        of what the index believes, to be compared against what is on disk.
+        """
+        state: dict[str, dict] = {}
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                limit=2048,
+                offset=offset,
+                with_payload=["path", "source", "mtime"],
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                path = payload.get("path")
+                if not path:
+                    continue
+                # Chunks of one file all carry the same values; first wins.
+                state.setdefault(
+                    path,
+                    {
+                        "source": payload.get("source") or path,
+                        # Absent for anything indexed before mtime was recorded.
+                        # Treated as "unknown", which reindexes it once.
+                        "mtime": payload.get("mtime"),
+                    },
+                )
+            if offset is None:
+                break
+        return state
+
     def indexed_paths(self) -> set[str]:
         paths: set[str] = set()
         offset = None
@@ -144,7 +180,9 @@ class Store:
             ),
         )
 
-    def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> None:
+    def upsert(
+        self, chunks: list[Chunk], vectors: list[list[float]], mtime: float | None = None
+    ) -> None:
         points = [
             qm.PointStruct(
                 id=_point_id(chunk.path, i),
@@ -156,6 +194,10 @@ class Store:
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
                     "symbol": chunk.symbol,
+                    # When the file on disk was last written. This is what lets
+                    # a later run tell "already indexed" from "indexed, then
+                    # edited while nothing was watching".
+                    "mtime": mtime,
                     "text": chunk.text,
                 },
             )
