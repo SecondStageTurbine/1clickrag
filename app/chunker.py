@@ -45,6 +45,13 @@ class Chunk:
     end_line: int  # 1-based, inclusive
     text: str
     symbol: str = ""
+    # The heading this chunk sits *under*, which is not the same as `symbol`:
+    # symbol labels the chunk (usually its own first line), while section says
+    # which part of the document it belongs to. Chunks continuing one section
+    # share it, which is what lets a retrieved paragraph be widened back out to
+    # the argument it was cut from, and what lets a citation say where in a
+    # document the passage lives rather than only which lines.
+    section: str = ""
     # The real file on disk. Differs from `path` only for archive members,
     # where path is "bundle.zip!doc.pdf" and source is "bundle.zip". Deletion
     # keys on this, so re-indexing a changed archive clears all its members.
@@ -129,6 +136,27 @@ def _boundaries(lines: list[str], language: str) -> tuple[list[int], set[int]]:
     return sorted(set(adjusted)), hard
 
 
+# A page or slide marker inserted by app/extract.py. For a PDF there are no
+# headings to speak of, so the page is the closest thing to a section.
+PAGE_MARKER = re.compile(r"^\[(?:page|slide)\s+\d+\]$")
+
+
+def _sections_for(lines: list[str], language: str) -> list[str]:
+    """The heading in force at every line, so chunks can inherit it."""
+    current = ""
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if MD_HEADING.match(stripped) and (
+            language == "markdown" or looks_like_markdown(lines[:400])
+        ):
+            current = stripped.lstrip("#").strip()[:120]
+        elif PAGE_MARKER.match(stripped):
+            current = stripped.strip("[]")[:120]
+        out.append(current)
+    return out
+
+
 def _symbol_for(lines: list[str], language: str) -> str:
     """Best-effort human label for a chunk (shown in results)."""
     for line in lines[:12]:
@@ -152,6 +180,7 @@ def _window(
     offset: int,
     budget: int,
     overlap_lines: int,
+    sections: list[str] | None = None,
 ) -> list[Chunk]:
     """Split an oversized boundary block into overlapping line windows."""
     chunks: list[Chunk] = []
@@ -172,6 +201,7 @@ def _window(
                 end_line=offset + j,
                 text="\n".join(body),
                 symbol=_symbol_for(body, language),
+                section=(sections[offset + i] if sections and offset + i < len(sections) else ""),
             )
         )
         if j >= n:
@@ -192,6 +222,7 @@ def chunk_file(
         return []
 
     lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    sections = _sections_for(lines, language)
     starts, hard = _boundaries(lines, language)
     starts.append(len(lines))
 
@@ -231,6 +262,7 @@ def chunk_file(
                 end_line=pending_start + len(body),
                 text="\n".join(body),
                 symbol=_symbol_for(body, language),
+                section=(sections[pending_start] if pending_start < len(sections) else ""),
             )
         )
         pending = []
@@ -248,7 +280,7 @@ def chunk_file(
         if size > chunk_chars:
             flush()
             chunks.extend(
-                _window(path, language, body, start, chunk_chars, overlap_lines)
+                _window(path, language, body, start, chunk_chars, overlap_lines, sections)
             )
             continue
 

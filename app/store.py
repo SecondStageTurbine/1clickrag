@@ -104,6 +104,50 @@ class Store:
         except Exception:
             return 0
 
+    def section_chunks(self, path: str, section: str, limit: int = 512) -> list[dict]:
+        """Every chunk of one file that sits under the same heading.
+
+        A chunk is a retrieval unit, not a unit of meaning: a long section is
+        cut into several, so the paragraph that matched a query is frequently
+        the middle of an argument whose beginning is the chunk above it. This
+        is what lets the answer be given the whole section.
+
+        Keys on `section` - the heading a chunk sits under - not on `symbol`,
+        which labels the chunk itself and is therefore different for every one
+        of them.
+        """
+        if not section:
+            return []
+        try:
+            points, _ = self.client.scroll(
+                collection_name=self.collection,
+                limit=limit,
+                scroll_filter=qm.Filter(
+                    must=[qm.FieldCondition(key="path", match=qm.MatchValue(value=path))]
+                ),
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            log.debug("section lookup failed for %s: %s", path, exc)
+            return []
+
+        chunks = []
+        for point in points:
+            payload = point.payload or {}
+            if payload.get("section") != section:
+                continue
+            chunks.append(
+                {
+                    "start_line": int(payload.get("start_line", 0) or 0),
+                    "end_line": int(payload.get("end_line", 0) or 0),
+                    "text": payload.get("text", ""),
+                    "section": payload.get("section", ""),
+                }
+            )
+        chunks.sort(key=lambda chunk: chunk["start_line"])
+        return chunks
+
     def indexed_state(self) -> dict[str, dict]:
         """Every indexed path with the source file and mtime it came from.
 
@@ -194,6 +238,7 @@ class Store:
                     "start_line": chunk.start_line,
                     "end_line": chunk.end_line,
                     "symbol": chunk.symbol,
+                    "section": chunk.section,
                     # When the file on disk was last written. This is what lets
                     # a later run tell "already indexed" from "indexed, then
                     # edited while nothing was watching".
@@ -265,6 +310,7 @@ class Store:
                     "start_line": payload.get("start_line", 0),
                     "end_line": payload.get("end_line", 0),
                     "symbol": payload.get("symbol", ""),
+                    "section": payload.get("section", ""),
                     "score": round(float(hit.score), 6),
                     "text": payload.get("text", ""),
                 }
@@ -272,3 +318,4 @@ class Store:
             if len(results) >= top_k:
                 break
         return results
+

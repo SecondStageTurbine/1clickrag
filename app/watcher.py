@@ -22,10 +22,13 @@ log = logging.getLogger("rag.watcher")
 
 
 class _Handler(FileSystemEventHandler):
-    def __init__(self, cfg: Config, store=None, embedder=None) -> None:
+    def __init__(self, cfg: Config, store=None, embedder=None, queue=None) -> None:
         self.cfg = cfg
         self.store = store
         self.embedder = embedder
+        # None falls back to indexing inline, which is what `python -m
+        # app.watcher` style use gets; the server always passes one.
+        self.queue = queue
         self._lock = threading.Lock()
         self._changed: set[str] = set()
         self._deleted: set[str] = set()
@@ -86,6 +89,19 @@ class _Handler(FileSystemEventHandler):
             self._deleted.clear()
             self._timer = None
 
+        # Record the work, do not do it. A file is often still being written
+        # when its change event arrives - Word writes a temp file and renames,
+        # a copy over the network lands in pieces - and indexing it here meant
+        # one failed read discarded the change permanently. The queue survives
+        # both that and the process dying mid-embed.
+        if self.queue is not None:
+            if deleted:
+                self.queue.enqueue(deleted, op="delete")
+            if changed:
+                self.queue.enqueue(changed, op="index")
+                log.info("queued %d changed file(s)", len(changed))
+            return
+
         try:
             if deleted:
                 remove_paths(self.cfg, deleted, store=self.store)
@@ -102,9 +118,11 @@ class _Handler(FileSystemEventHandler):
             log.warning("watch re-index failed: %s", exc)
 
 
-def start_watcher(cfg: Config, store=None, embedder=None) -> Observer:
+def start_watcher(cfg: Config, store=None, embedder=None, queue=None) -> Observer:
     observer = Observer()
-    observer.schedule(_Handler(cfg, store, embedder), cfg.repo_path, recursive=True)
+    observer.schedule(
+        _Handler(cfg, store, embedder, queue), cfg.repo_path, recursive=True
+    )
     observer.daemon = True
     observer.start()
     log.info(

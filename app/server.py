@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 from .config import CONFIG, corpus_warning
 from .embedder import make_embedder
 from .graph import open_graph
-from .ingest import run_ingest
+from .ingest import remove_paths, run_ingest
+from .queue import WorkQueue
 from .reranker import Reranker
 from .store import Store
 from .watcher import start_watcher
@@ -57,6 +58,9 @@ reranker = (
 # Keyword index + entity graph. None when disabled or unopenable, and every
 # use is guarded: this is an addition to vector search, never a dependency of it.
 graph = open_graph(CONFIG)
+# Durable record of work the watcher has seen. Opened eagerly so a restart
+# reports what it inherited rather than discovering it later.
+queue = WorkQueue(CONFIG.queue_path, max_attempts=CONFIG.queue_max_attempts)
 
 STATE: dict = {
     "ingest_running": False,
@@ -66,6 +70,70 @@ STATE: dict = {
     "started_at": time.time(),
     "warning": None,
 }
+
+
+def start_queue_worker(cfg) -> threading.Thread:
+    """Drain the durable queue: index what is due, retry what fails.
+
+    Runs one batch at a time and reports per-path outcomes back to the queue,
+    so a single unreadable file backs off on its own without holding up the
+    twenty good ones queued behind it.
+    """
+
+    def loop() -> None:
+        while True:
+            time.sleep(cfg.queue_poll_seconds)
+            try:
+                batch = queue.claim(cfg.queue_batch)
+                if not batch:
+                    continue
+                if STATE["ingest_running"]:
+                    continue  # a reindex or rescan holds the lock; try later
+
+                deletes = [item["path"] for item in batch if item["op"] == "delete"]
+                indexes = [item["path"] for item in batch if item["op"] != "delete"]
+
+                STATE["ingest_running"] = True
+                try:
+                    if deletes:
+                        try:
+                            remove_paths(cfg, deletes, store=store)
+                            queue.complete(deletes)
+                        except Exception as exc:
+                            for path in deletes:
+                                queue.fail(path, str(exc))
+
+                    if indexes:
+                        try:
+                            stats = run_ingest(
+                                cfg, full=False, paths=indexes,
+                                store=store, embedder=embedder,
+                            )
+                            failed = stats.failures
+                            queue.complete([p for p in indexes if p not in failed])
+                            for path, error in failed.items():
+                                queue.fail(path, error)
+                            if stats.files_indexed:
+                                STATE["last_ingest"] = time.time()
+                        except Exception as exc:
+                            # The whole batch fell over - the store is down, say.
+                            # Blame every path in it; they retry individually.
+                            for path in indexes:
+                                queue.fail(path, str(exc))
+                finally:
+                    STATE["ingest_running"] = False
+            except Exception as exc:
+                # The worker must outlive anything it processes.
+                log.warning("queue worker error: %s", exc)
+
+    thread = threading.Thread(target=loop, name="rag-queue", daemon=True)
+    thread.start()
+    counts = queue.counts()
+    if counts["pending"]:
+        log.info("queue worker started - %d item(s) carried over", counts["pending"])
+    else:
+        log.info("queue worker started")
+    return thread
 
 
 def start_rescan(cfg) -> threading.Thread:
@@ -164,8 +232,9 @@ def _bootstrap() -> None:
             # pay the download and the model load while a user waits.
             reranker.prepare()
 
+        start_queue_worker(CONFIG)
         if CONFIG.watch:
-            start_watcher(CONFIG, store=store, embedder=embedder)
+            start_watcher(CONFIG, store=store, embedder=embedder, queue=queue)
         if CONFIG.rescan_minutes > 0:
             start_rescan(CONFIG)
     except Exception as exc:
@@ -266,6 +335,7 @@ def stats():
         "vector_store": "embedded" if store.embedded else "server",
         "watching": CONFIG.watch,
         "rescan_minutes": CONFIG.rescan_minutes,
+        "queue": queue.counts(),
         "indexing": STATE["ingest_running"],
         "last_ingest": STATE["last_ingest"],
         "last_reconcile": STATE["last_reconcile"],
@@ -300,11 +370,26 @@ def _fuse(rankings: list[tuple[str, list[dict]]], k: int) -> list[dict]:
             if key not in entries:
                 entries[key] = hit
 
-    fused = []
+    ordered = []
     for key in sorted(scores, key=lambda item: -scores[item]):
         entry = dict(entries[key])
         entry["score"] = round(scores[key], 6)
         entry["origins"] = origins[key]
+        ordered.append(entry)
+
+    # Each arm drops its own overlapping chunks, but chunking overlaps on
+    # purpose, so two arms can return lines 62-68 and 63-68 of one file and the
+    # fusion sees two distinct keys. Left alone that spends the answer's budget
+    # showing the same paragraph twice.
+    fused: list[dict] = []
+    kept_spans: dict[str, list[tuple[int, int]]] = {}
+    for entry in ordered:
+        spans = kept_spans.setdefault(entry["path"], [])
+        start = int(entry.get("start_line", 0) or 0)
+        end = int(entry.get("end_line", 0) or 0)
+        if any(start <= kept_end and end >= kept_start for kept_start, kept_end in spans):
+            continue
+        spans.append((start, end))
         fused.append(entry)
     return fused
 
@@ -439,6 +524,9 @@ class ContextRequest(BaseModel):
     path_prefix: str | None = None
     hybrid: bool | None = None
     hops: int | None = Field(default=None, ge=0, le=3)
+    # Widen each hit to the rest of its section before assembling. None uses
+    # the server default.
+    expand: bool | None = None
     # Character budget for the assembled block. Whole chunks are dropped from
     # the bottom to fit; a chunk is never cut in half, because a generator
     # handed a sentence that stops mid-clause will finish it from imagination.
@@ -471,26 +559,87 @@ def context(request: ContextRequest):
     body = json.loads(bytes(found.body))
     hits = body.get("results", [])
 
+    expand = CONFIG.context_expand if request.expand is None else request.expand
+
+    # Expansion first, numbering second. Two hits from one section widen to the
+    # same passage, and numbering as we go would hand the generator the same
+    # text twice under two citations - paying for it twice out of the budget,
+    # and inviting an answer that cites [2] and [3] as if they corroborated
+    # each other.
+    prepared: list[dict] = []
+    seen_citations: set[str] = set()
+    for hit in hits:
+        text = hit["text"]
+        start_line = hit["start_line"]
+        end_line = hit["end_line"]
+        expanded = False
+
+        if expand and hit.get("section"):
+            # Rebuild the run of chunks around this one that share its heading.
+            # Only the contiguous run: a heading repeated later in the file is
+            # a different section with the same name, and splicing the two
+            # would invent a passage that does not exist.
+            section = store.section_chunks(hit["path"], hit["section"])
+            run: list[dict] = []
+            for chunk in section:
+                if run and chunk["start_line"] > run[-1]["end_line"] + 1:
+                    if run[0]["start_line"] <= start_line <= run[-1]["end_line"]:
+                        break
+                    run = []
+                run.append(chunk)
+            if run and run[0]["start_line"] <= start_line <= run[-1]["end_line"] and len(run) > 1:
+                merged = "\n".join(chunk["text"] for chunk in run)
+                # Never let one expanded section eat the whole budget.
+                if len(merged) <= max(request.max_chars // 2, len(text)):
+                    text = merged
+                    start_line = run[0]["start_line"]
+                    end_line = run[-1]["end_line"]
+                    expanded = True
+
+        citation = f"{hit['path']}:{start_line}-{end_line}"
+        if citation in seen_citations:
+            continue
+        seen_citations.add(citation)
+
+        # The heading rides on the citation line: it tells a reader (and a
+        # generator writing "according to the Deployment section") where in the
+        # document this sits, which line numbers alone never do.
+        heading = (hit.get("section") or hit.get("symbol") or "").strip().splitlines()[0:1]
+        prepared.append(
+            {
+                "citation": citation,
+                "text": text,
+                "heading": heading[0][:120] if heading and heading[0] else "",
+                "expanded": expanded,
+                "path": hit["path"],
+                "start_line": start_line,
+                "end_line": end_line,
+                "score": hit["score"],
+            }
+        )
+
     blocks: list[str] = []
     sources: list[dict] = []
     used = 0
     dropped = 0
-    for index, hit in enumerate(hits, start=1):
-        citation = f"{hit['path']}:{hit['start_line']}-{hit['end_line']}"
-        block = f"[{index}] {citation}\n{hit['text']}"
+    for index, item in enumerate(prepared, start=1):
+        label = f" ({item['heading']})" if item["heading"] else ""
+        block = f"[{index}] {item['citation']}{label}\n{item['text']}"
         if used + len(block) > request.max_chars and blocks:
-            dropped = len(hits) - len(blocks)
+            dropped = len(prepared) - len(blocks)
             break
         blocks.append(block)
         used += len(block) + 2
         sources.append(
             {
                 "n": index,
-                "path": hit["path"],
-                "start_line": hit["start_line"],
-                "end_line": hit["end_line"],
-                "score": hit["score"],
-                "citation": citation,
+                "path": item["path"],
+                "start_line": item["start_line"],
+                "end_line": item["end_line"],
+                "score": item["score"],
+                "citation": item["citation"],
+                "heading": item["heading"],
+                "expanded": item["expanded"],
             }
         )
 
@@ -623,6 +772,28 @@ def graph_path(request: PathRequest):
     if problem:
         return problem
     return graph.path_between(request.start, request.end, max_hops=request.max_hops)
+
+
+@app.get("/queue")
+def queue_state(limit: int = 50):
+    """What is waiting to be indexed, and what has been given up on.
+
+    The dead-letter list is the point: a file that cannot be read is normally
+    a log line nobody reads, and this makes it something you can query, fix,
+    and retry deliberately.
+    """
+    return queue.snapshot(limit=min(max(limit, 1), 500))
+
+
+class QueueRetryRequest(BaseModel):
+    path: str | None = None
+
+
+@app.post("/queue/retry")
+def queue_retry(request: QueueRetryRequest):
+    """Put dead letters back in the queue - after fixing whatever broke."""
+    moved = queue.retry_dead(request.path)
+    return {"requeued": moved}
 
 
 class ReindexRequest(BaseModel):

@@ -13,7 +13,7 @@ import argparse
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .chunker import chunk_file
 from .config import CONFIG, Config
@@ -56,6 +56,9 @@ class IngestStats:
     files_removed: int = 0
     chunks: int = 0
     errors: int = 0
+    # Which files failed, not just how many. The work queue retries by path, so
+    # a count would leave it guessing which item to blame for a failed batch.
+    failures: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -66,6 +69,7 @@ class IngestStats:
             "files_removed": self.files_removed,
             "chunks": self.chunks,
             "errors": self.errors,
+            "failures": self.failures,
         }
 
 
@@ -298,6 +302,7 @@ def run_ingest(
                 index_file(rel_path, language, cfg, embedder, store, stats)
             except Exception as exc:
                 stats.errors += 1
+                stats.failures[rel_path] = str(exc)
                 log.warning("failed to index %s: %s", rel_path, exc)
             if total > 50 and i % 50 == 0:
                 log.info("  %d/%d files (%d chunks)", i, total, stats.chunks)

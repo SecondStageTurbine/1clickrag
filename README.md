@@ -42,7 +42,8 @@ Python and tells you exactly what to do if it is missing.
 | **Reads almost anything** | PDF, Word, Excel, PowerPoint, email, HTML, code, and inside `.zip` — [formats](#what-it-can-read) |
 | **Stays current** | a watcher for live edits, a reconcile for whatever changed while it was off — [how](#keeping-it-running-and-keeping-it-current) |
 | **Stays running** | one command registers it to start at logon and revive itself — [autostart](#autostart) |
-| **Cited answers** | `/context` returns numbered, quotable passages for an LLM to answer from — [the "G" in RAG](#feeding-an-llm-the-g-in-rag) |
+| **Cited answers** | `/context` returns numbered passages, cited by file, lines and section — [the "G" in RAG](#feeding-an-llm-the-g-in-rag) |
+| **Nothing lost quietly** | changes are queued to disk, retried with backoff, and dead-lettered where you can see them — [how](#nothing-is-indexed-on-a-promise) |
 | **A shell client** | project-scoped questions, two query modes, one standard prompt — [PowerShell client](#the-powershell-client-rag-clientpsm1) |
 | **Travels offline** | one zip carries the code, the wheels and the models to an air-gapped PC — [taking it elsewhere](#taking-it-to-another-pc) |
 
@@ -184,6 +185,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/search` | POST | Ranked hits, snippet-truncated |
 | `/search/full` | POST | Ranked hits, full chunk text |
 | `/context` | POST | The same hits, assembled into a citable block for a generator |
+| `/queue` | GET | Pending, retrying and dead-lettered index work |
+| `/queue/retry` | POST | Requeue dead letters, optionally one `path` |
 | `/entities` | GET | Names the index knows about, most-mentioned first |
 | `/graph/neighbors` | POST | What shares documents with a name, with citations |
 | `/graph/path` | POST | How two names connect, hop by hop |
@@ -251,6 +254,57 @@ ten minutes in a hidden window with nobody watching.
 **What still needs a hand:** a *directory* deleted wholesale is not always
 reported per-file by Windows, so its documents are pruned by the next reconcile
 rather than instantly. Startup and the periodic rescan both cover it.
+
+### Nothing is indexed on a promise
+
+A change is **written down before it is acted on**. The watcher records what it
+saw in a small SQLite queue; a worker drains it. That matters because the moment
+a file changes is exactly the moment it is least readable — Word still holds the
+handle, a network copy has landed in pieces — and indexing inline meant one
+failed read discarded the change for good.
+
+Failures back off (5s, 10s, 20s…) and retry. After `RAG_QUEUE_MAX_ATTEMPTS` an
+item is parked in a dead-letter table, where it stops burning retries and starts
+being evidence:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:49404/queue        # pending, retrying, dead
+Invoke-RestMethod http://127.0.0.1:49404/queue/retry -Method POST `
+  -Body '{}' -ContentType 'application/json'          # requeue after a fix
+```
+
+The queue is on disk, so work survives a crash or a reboot — the point of
+running unattended for weeks.
+
+## Sections, not just line ranges
+
+Each chunk records the heading it sits **under**, which is different from the
+label describing the chunk itself. Two things follow.
+
+**Citations say where in the document a passage lives:**
+
+```
+[2] Volume_I/ch08_cutting_documents_into_pieces.md:25-40 (The Problem)
+```
+
+**And a hit can be widened back to its section.** A chunk is a retrieval unit,
+not a unit of meaning: a long section is cut into several, so the paragraph that
+matched is frequently the middle of an argument whose beginning is the chunk
+above it. With `expand` on (the default), `/context` rebuilds the contiguous run
+of chunks sharing that heading and cites the widened range:
+
+```powershell
+$body = @{query='why does chunk size matter?'; top_k=4; expand=$true} | ConvertTo-Json
+$r = Invoke-RestMethod -Uri http://127.0.0.1:49404/context -Method POST -Body $body -ContentType 'application/json'
+$r.sources | Select-Object n, citation, heading, expanded
+```
+
+Only the *contiguous* run: a heading repeated later in the file is a different
+section with the same name, and splicing the two would invent a passage that
+does not exist. An expanded section is capped at half the character budget, so
+one long section cannot crowd out every other answer. `RAG_CONTEXT_EXPAND=0`, or
+`"expand": false` per request, turns it off — worth doing for wide surveys where
+breadth beats depth.
 
 ## Pointing it at a different repository
 
