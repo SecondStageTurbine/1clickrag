@@ -485,8 +485,8 @@ function New-Bundle {
 # .data\context-cache and .data\graph.db, which hold the same document text in
 # plain form (FTS5 stores what it indexes), .git - this is a tool being
 # delivered, not a checkout being cloned, and the whole history would otherwise
-# ride along in every copy - and the pid/log files, which describe a run on this
-# machine and mean nothing on the next one.
+# ride along in every copy - and the pid, log and work-queue files, which
+# describe a run on this machine and mean nothing on the next one.
 function New-Package {
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('rag-package-' + [guid]::NewGuid().ToString('N'))
     $zip = Join-Path (Split-Path $PSScriptRoot -Parent) 'rag-portable.zip'
@@ -514,7 +514,7 @@ function New-Package {
     $null = robocopy $PSScriptRoot $stage /E `
         /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant') `
             (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
-        /XF 'graph.db*' 'rag.pid' 'rag.log' 'rag.log.err'
+        /XF 'graph.db*' 'ingest-queue.db*' 'rag.pid' 'rag.log' 'rag.log.err'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
 
     # Strip THIS machine's corpus from the packaged .env. Carrying it over means
