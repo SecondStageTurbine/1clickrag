@@ -9,10 +9,34 @@ third-party package installed.
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 from typing import Iterator
 
 from .config import FILENAME_LANGUAGES, LANGUAGE_BY_EXT, Config
+
+log = logging.getLogger("rag.scanner")
+
+# Windows reserved device names. A file called "nul" is not a file: the path
+# resolves to the device \\.\nul, and os.path.relpath then raises ValueError
+# because the two paths are on different "mounts". Unhandled, that escapes the
+# generator and aborts the entire walk - so one stray file left behind by a
+# shell redirect (`something > nul` under a POSIX shell writes a real file)
+# takes down the whole ingest, not just itself.
+#
+# The reservation applies whatever the extension: "nul.txt" is the same device.
+WINDOWS_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{n}" for n in range(1, 10)}
+    | {f"lpt{n}" for n in range(1, 10)}
+)
+
+
+def is_device_name(filename: str) -> bool:
+    """True for a name Windows resolves to a device rather than a file."""
+    if os.name != "nt":
+        return False
+    return os.path.basename(filename).split(".")[0].strip().lower() in WINDOWS_DEVICE_NAMES
 
 
 def language_for(filename: str, cfg: Config) -> str | None:
@@ -66,7 +90,17 @@ def iter_source_files(cfg: Config) -> Iterator[tuple[str, str]]:
         dirnames[:] = sorted(d for d in dirnames if d not in cfg.exclude_dirs)
         for filename in sorted(filenames):
             abs_path = os.path.join(dirpath, filename)
-            rel_path = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            if is_device_name(filename):
+                log.warning("skipping reserved device name: %s", abs_path)
+                continue
+            try:
+                rel_path = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            except ValueError as exc:
+                # Anything else the platform refuses to make relative. Skipping
+                # one file is a gap in the index; letting it raise here is no
+                # index at all.
+                log.warning("skipping unusable path %s: %s", abs_path, exc)
+                continue
             if is_excluded(rel_path, cfg):
                 continue
 
