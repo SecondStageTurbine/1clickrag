@@ -155,12 +155,16 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/search` | POST | Ranked hits, snippet-truncated |
 | `/search/full` | POST | Ranked hits, full chunk text |
 | `/context` | POST | The same hits, assembled into a citable block for a generator |
+| `/entities` | GET | Names the index knows about, most-mentioned first |
+| `/graph/neighbors` | POST | What shares documents with a name, with citations |
+| `/graph/path` | POST | How two names connect, hop by hop |
 | `/reindex` | POST | `{"full": false}` — background re-ingest |
 | `/api-docs` | GET | Generated OpenAPI docs |
 
 Search body fields: `query` (required), `top_k` (default 5), `language_filter`
 (`rs`, `markdown`, `toml`, `ld`, `yaml`, `json`, `conf`, `sh`, `ps1`, `py`,
-`asm`), `path_prefix` (e.g. `kernel/src`).
+`asm`), `path_prefix` (e.g. `kernel/src`), `hybrid` (fuse BM25 with the vector
+ranking, default on), `hops` (graph expansion, default off).
 
 **Check `.status`, not `.ollama`.** Native mode has no Ollama, so `/health`
 reports `embeddings` and `embed_backend` instead; `ollama` appears only when
@@ -559,13 +563,105 @@ turns all of it off, and `Expand-RagQuery` shows what a question becomes.
 | `Find-RagLiteral` | Literal search over the corpus, scoped the same way |
 | `Get-RagProject`, `Set-RagProject`, `Remove-RagProject` | Manage projects |
 | `Get-RagPrefix` | Candidate `path_prefix` values from the real corpus layout |
+| `Get-RagEntity` | Names the index knows about (`-Kind identifier` for exact-match strings) |
+| `Get-RagNeighbor` | What shares documents with a name, with evidence citations |
+| `Get-RagPath` | How two names connect, hop by hop |
 | `Update-RagContextCache`, `Get-RagContextCache`, `Clear-RagContextCache` | Per-project background context |
 | `Expand-RagQuery` | Show what a question becomes before it is embedded |
 
+`-Hops 1` on `Ask-Rag`, `Get-RagContext` and `Invoke-RagSearch` turns on graph
+expansion for that question; `-NoHybrid` drops back to vectors alone.
+
 `Ask-Rag` returns an object: `.Prompt`, `.Context`, `.Sources`, `.ChunksUsed`,
-`.ChunksDropped`, `.Fallback`, plus the scope it resolved. `-Raw` returns the
+`.ChunksDropped`, `.Fallback`, `.Ranking`, `.Graph`, plus the scope it resolved. `-Raw` returns the
 prompt string alone; `-OutFile` writes it. `$env:RAG_API` or `-Api` points the
 client at a server on another port or host.
+
+## Keyword search and the entity graph
+
+Vector search has two blind spots, and both are fixed by one SQLite file next
+to the vectors (`.data/graph.db`). `sqlite3` is in the standard library and the
+bundled interpreter has FTS5, so this costs no dependency, no daemon and
+nothing in an offline install. It is built during ingest — a corpus indexed
+before this existed needs `Rag.bat reindex -Full` to populate it.
+
+**1. Exact strings.** Embeddings are worst at precisely what people search for
+most confidently: ticket IDs, part numbers, standards, error codes. `NW-2200`
+means nothing in vector space. So the same chunks are also indexed for BM25,
+and the two rankings are fused rather than chosen between:
+
+```powershell
+$body = @{query='NW-2200 pressure fault'; top_k=8} | ConvertTo-Json
+$r = Invoke-RestMethod -Uri http://127.0.0.1:49404/search -Method POST -Body $body -ContentType 'application/json'
+$r.ranking                      # vector, keyword, rerank - what produced the order
+$r.results[0].origins           # which arms found this particular chunk
+```
+
+Ranks are fused, not scores: a cosine similarity, a BM25 value and an entity
+count share no scale, and normalising them against each other invents a
+comparison that does not exist. A chunk two arms both liked outranks one that a
+single arm liked slightly more. `"hybrid": false` in the body turns it off.
+
+**Check `.ranking` before reading `.score`.** It is a cosine similarity with
+one arm, a fused rank weight with several, and an unbounded cross-encoder logit
+when reranking is on — the three are not comparable, and only the caller knows
+which one it is looking at.
+
+**2. Multi-hop.** *"Which supplier makes the part that failed?"* is two lookups
+chained through a shared name, and one similarity search cannot do it. During
+ingest, each chunk's entity mentions are recorded; `hops` resolves the names in
+a question to entities, walks out through the documents they share, and adds
+those chunks as candidates:
+
+```powershell
+$body = @{query='what does the part that failed at Harborline cost?'; top_k=8; hops=1} | ConvertTo-Json
+$r = Invoke-RestMethod -Uri http://127.0.0.1:49404/context -Method POST -Body $body -ContentType 'application/json'
+$r.graph.seeds      # Harborline, NW-2200
+$r.graph.reached    # SKU, List Prices, Hydraulic, Lead Time, NW-2260 ...
+```
+
+There are deliberately **no triples**. A stored "A supplies B" would be a claim
+this stack cannot check without a language model, and extracting it reliably
+needs a dependency parser — a hundred megabytes per Python version in a bundle
+that has to install offline. Co-occurrence claims only that two names appear
+together, which is all retrieval needs: the graph widens the candidate set and
+the reranker narrows it again. Entity extraction is regex and a stop list over
+text already in memory, so ingest costs a few percent more, not a multiple.
+
+Edges are derived from the mentions table rather than stored, which is why an
+incremental re-ingest cannot leave a stale one behind, and why every edge comes
+with the passages it rests on:
+
+```powershell
+Get-RagNeighbor 'NW-2200' -Hops 1        # SKU, List Prices, Hydraulic, Lead Time
+Get-RagEntity -Kind identifier            # what the index would match exactly
+Get-RagPath -From 'Harborline' -To 'NW-9001'
+```
+
+**What to expect.** The keyword arm earns its place immediately — on a test
+corpus here it returned five or six chunks per query that the vector arm never
+surfaced. The graph arm is a recall mechanism: it changes what enters the
+candidate pool more than it changes the top few, especially with reranking on
+and `RAG_RERANK_CANDIDATES` set high, since the cross-encoder is then already
+reading a wide pool. Turn `hops` on for "who else was involved", "what depends
+on this", "trace this part across documents"; leave it off for questions about
+one passage.
+
+**The df ceiling matters.** An entity in more than `RAG_GRAPH_MAX_DF` of the
+documents (default 20%) is treated as boilerplate and dropped from the graph —
+a header, a footer, or the corpus's own subject connects everything to
+everything. On a mixed document share this is what keeps the graph clean. On a
+single-subject corpus it is too aggressive: index one book and its main
+characters appear in most chapters, so the default hides exactly the names you
+would ask about. `GET /entities?include_common=true` shows what is being
+filtered, and the ceiling itself.
+
+**Known limits.** Entity extraction is patterns, not a model: it catches
+capitalised names, acronyms and identifier-shaped strings, and misses lower-case
+ones (a domain in an email body, a product written in running text). PDF text
+with hyphenation and wrapped lines extracts worse than Markdown. `/graph/path`
+is best-effort — on prose it can route through a weak link, so read the
+evidence citations before believing a chain.
 
 ## If results look wrong
 

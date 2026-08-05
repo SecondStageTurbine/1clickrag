@@ -267,6 +267,37 @@ class Config:
     )
     rerank_candidates: int = _env_int("RAG_RERANK_CANDIDATES", 40)
 
+    # Keyword search and the entity graph, in one SQLite file beside the
+    # vectors. Stdlib-only (the bundled interpreter has FTS5), so this costs
+    # nothing in an offline install and no daemon at runtime. Turning it off
+    # leaves plain vector search exactly as it was; turning it on takes effect
+    # for a file when that file is next indexed, so a corpus indexed before
+    # this existed needs `reindex -Full` to populate it.
+    graph: bool = _env_bool("RAG_GRAPH", True)
+    graph_path: str = os.environ.get(
+        "RAG_GRAPH_PATH", os.path.join(_DEFAULT_DATA, "graph.db")
+    )
+    # Fuse BM25 with the vector ranking instead of using vectors alone. This is
+    # what makes exact strings - ticket IDs, part numbers, error codes -
+    # findable, which is the one thing embeddings are reliably bad at.
+    hybrid: bool = _env_bool("RAG_HYBRID", True)
+    # Reciprocal-rank-fusion constant. Ranks, not scores, are combined: a cosine
+    # similarity, a BM25 score and an entity-overlap count share no scale, and
+    # normalising them against each other invents a comparison that does not
+    # exist.
+    rrf_k: int = _env_int("RAG_RRF_K", 60)
+
+    # An entity in more than this share of the documents is boilerplate - a
+    # header, a footer, the corpus's own subject - and connects everything to
+    # everything. Raise it on a corpus of unrelated documents.
+    graph_max_df: float = float(os.environ.get("RAG_GRAPH_MAX_DF", "0.2"))
+    # How many neighbours one entity contributes per hop.
+    graph_fanout: int = _env_int("RAG_GRAPH_FANOUT", 8)
+    # Default hops for /search and /context. 0 keeps graph expansion opt-in per
+    # request: it widens the candidate set, which is what you want for
+    # "who else was involved", and noise for "what does this sentence mean".
+    graph_hops: int = _env_int("RAG_GRAPH_HOPS", 0)
+
     embed_batch: int = _env_int("RAG_EMBED_BATCH", 32)
     # ONNX inference threads. Defaults to this machine's core count rather than
     # leaving onnxruntime to choose, because a portable copy lands on an unknown
