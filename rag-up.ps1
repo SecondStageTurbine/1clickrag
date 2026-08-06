@@ -520,14 +520,17 @@ function New-Package {
     # Strip THIS machine's corpus from the packaged .env. Carrying it over means
     # the target points at a path that does not exist there, and - worse - the
     # first-run folder picker never appears, because a corpus looks configured.
-    # Everything else in .env (port, threads, model) is worth taking along.
+    # RAG_CHAT_API_KEY goes for a different reason: this zip gets copied onto
+    # other machines and published as a release asset, and a key that has been
+    # in one is compromised. Everything else in .env (port, threads, model,
+    # which chat provider) is worth taking along.
     $stagedEnv = Join-Path $stage '.env'
     if (Test-Path $stagedEnv) {
         $kept = Get-Content $stagedEnv |
-            Where-Object { $_ -notmatch '^\s*RAG_(REPO_MOUNT|REPO_LABEL)\s*=' }
+            Where-Object { $_ -notmatch '^\s*RAG_(REPO_MOUNT|REPO_LABEL|CHAT_API_KEY)\s*=' }
         if ($kept) { Set-Content -Path $stagedEnv -Value $kept -Encoding ascii }
         else { Remove-Item $stagedEnv -Force }
-        Write-Host '    (cleared the corpus path - the target will ask for its own)'
+        Write-Host '    (cleared the corpus path and any chat API key)'
     }
 
     Write-Host '==> compressing' -ForegroundColor Cyan

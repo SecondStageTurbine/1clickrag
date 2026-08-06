@@ -126,6 +126,8 @@ LANGUAGE_BY_EXT: dict[str, str] = {
     ".eml": "email",
     ".msg": "email",
     ".xml": "xml",
+    # A comic archive - page images in a zip. Only readable with RAG_OCR=1.
+    ".cbz": "comic",
 }
 
 # Files with no extension that are still worth indexing.
@@ -342,6 +344,41 @@ class Config:
     # a generator. A chunk is a retrieval unit, not a unit of meaning: the
     # paragraph that matched is often the middle of the argument.
     context_expand: bool = _env_bool("RAG_CONTEXT_EXPAND", True)
+
+    # --- the chat pane ------------------------------------------------------
+    # Which generator writes the answers, or empty for none. Empty is the
+    # default and is not a placeholder: this installs on machines with no
+    # internet and no local model, and search works exactly as before without
+    # it. /chat answers 501 and the browser UI hides the tab.
+    #   anthropic  the Claude Messages API
+    #   openai     any OpenAI-compatible /chat/completions (OpenAI, Codex
+    #              models, llama.cpp, LM Studio, vLLM, Ollama's shim)
+    #   ollama     Ollama's own /api/chat
+    chat_provider: str = os.environ.get("RAG_CHAT_PROVIDER", "").strip().lower()
+    chat_model: str = os.environ.get("RAG_CHAT_MODEL", "")
+    # Base URL. Ignored for anthropic; defaults to https://api.openai.com/v1
+    # for openai and http://127.0.0.1:11434 for ollama.
+    chat_url: str = os.environ.get("RAG_CHAT_URL", "")
+    # Never checked into the repo and stripped from the packaged .env - it
+    # belongs in rag/.env on the machine that has it, or in the environment.
+    chat_api_key: str = os.environ.get("RAG_CHAT_API_KEY", "")
+    # Ceiling on the answer. Generous because the newer Claude models count
+    # their own reasoning against this budget, so a tight one truncates the
+    # answer rather than merely shortening it.
+    chat_max_tokens: int = _env_int("RAG_CHAT_MAX_TOKENS", 4096)
+    # Low on purpose: the job is to report what the passages say, not to write
+    # around them. Not sent to the Claude models, which reject sampling
+    # parameters outright.
+    chat_temperature: float = float(os.environ.get("RAG_CHAT_TEMPERATURE", "0.2"))
+    # Seconds to wait for a whole answer. A 7B model on CPU is slow.
+    chat_timeout: float = float(os.environ.get("RAG_CHAT_TIMEOUT", "180"))
+    # Retrieval for one chat turn: how many chunks, and how many characters of
+    # them survive into the prompt.
+    chat_top_k: int = _env_int("RAG_CHAT_TOP_K", 8)
+    chat_context_chars: int = _env_int("RAG_CHAT_CONTEXT_CHARS", 12000)
+    # Prior turns replayed to the generator. The retrieved passages are the
+    # expensive part of each prompt, so history is kept short deliberately.
+    chat_history_turns: int = _env_int("RAG_CHAT_HISTORY_TURNS", 6)
     # Watching defaults OFF for a UNC share. SMB does not deliver change
     # notifications dependably, so the watcher would appear to work while
     # quietly missing edits - worse than not running, because the index looks
@@ -382,6 +419,32 @@ class Config:
     extra_text_exts: dict = field(
         default_factory=lambda: _parse_ext_map(_env_list("RAG_EXTRA_TEXT_EXTS", []))
     )
+
+    # --- OCR ----------------------------------------------------------------
+    # Read text off pages that carry it as pixels: scans, photographed reports,
+    # comics. Off by default because it is roughly a thousand times slower than
+    # reading a text layer - seconds per page against microseconds - so a folder
+    # of scans is an overnight job rather than a pause, and nobody should
+    # discover that by starting one unawares. With this off, a PDF whose pages
+    # have no text layer is reported in the log and indexed as empty.
+    ocr: bool = _env_bool("RAG_OCR", False)
+    # A page yielding fewer than this many characters is treated as scanned and
+    # sent to OCR. Not zero: a scanned page often carries a stray ligature or a
+    # stamped page number in its text layer while the actual words are pixels.
+    ocr_min_chars: int = _env_int("RAG_OCR_MIN_CHARS", 20)
+    # Height of one recognition band, and how much consecutive bands share.
+    # Tall pages are sliced rather than shrunk: fitting a 20,000px webtoon strip
+    # into the detector's window squashes the text into illegibility. The
+    # overlap stops a line falling in a cut from being lost.
+    ocr_band: int = _env_int("RAG_OCR_BAND", 2200)
+    ocr_overlap: int = _env_int("RAG_OCR_OVERLAP", 200)
+    # Readings below this score are dropped. Artwork is the reason: a detector
+    # pointed at a drawing finds "text" in hatching and panel borders, and those
+    # come back with low scores and no meaning.
+    ocr_min_confidence: float = float(os.environ.get("RAG_OCR_MIN_CONFIDENCE", "0.5"))
+    # A guard against a corrupt or synthetic page claiming an enormous size and
+    # exhausting memory during render, not a resolution policy.
+    ocr_max_megapixels: int = _env_int("RAG_OCR_MAX_MEGAPIXELS", 80)
 
     # Look inside .zip archives and index the documents they contain.
     archives: bool = _env_bool("RAG_ARCHIVES", True)
