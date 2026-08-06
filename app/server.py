@@ -308,6 +308,12 @@ def health():
         "chunks": chunks,
         "model": CONFIG.embed_model,
         "collection": CONFIG.collection,
+        # Which folder these answers come from. /stats has carried this all
+        # along, but nothing polls /stats - so the browser could show a healthy
+        # index for minutes without ever saying what was in it, and one machine
+        # running two collections looked identical to one running the right one.
+        "repo": CONFIG.repo_label,
+        "repo_path": CONFIG.repo_path,
         "indexing": STATE["ingest_running"],
         "error": STATE["ingest_error"],
         "warning": STATE["warning"],
