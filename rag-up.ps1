@@ -716,7 +716,7 @@ function New-Package {
     $null = robocopy $PSScriptRoot $stage /E `
         /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant') `
             (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
-        /XF 'graph.db*' 'ingest-queue.db*' 'rag.pid' 'rag.log' 'rag.log.err'
+        /XF 'graph.db*' 'ingest-queue.db*' 'rag.pid' '*.log' '*.err'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
 
     # Strip THIS machine's corpus from the packaged .env. Carrying it over means
