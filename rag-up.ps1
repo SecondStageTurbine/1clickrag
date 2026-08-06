@@ -718,29 +718,64 @@ function New-Package {
             (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
         /XF 'graph.db*' 'ingest-queue.db*' 'rag.pid' '*.log' '*.err'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
+    # robocopy reports what it did in its exit code - 1 means "files copied",
+    # which is success. Left alone it becomes the script's own exit code, so a
+    # package that worked perfectly ends with Rag.bat printing "[exit code 1]"
+    # and any caller checking the status treating it as a failure.
+    $global:LASTEXITCODE = 0
 
-    # Strip THIS machine's corpus from the packaged .env. Carrying it over means
-    # the target points at a path that does not exist there, and - worse - the
-    # first-run folder picker never appears, because a corpus looks configured.
-    # RAG_CHAT_API_KEY goes for a different reason: this zip gets copied onto
-    # other machines and published as a release asset, and a key that has been
-    # in one is compromised. Everything else in .env (port, threads, model,
-    # which chat provider) is worth taking along.
+    # Clear the packaged .env of everything that is a decision about THIS
+    # machine, keeping the tuning that travels (port, threads, embedding model,
+    # exclusions).
+    #
+    # The corpus, because the target points at a path that does not exist there
+    # and - worse - the first-run folder picker never appears, since a corpus
+    # looks configured. RAG_CHAT_API_KEY, because this zip gets copied between
+    # machines and published as a release asset, and a key that has been in one
+    # is compromised. And everything the setup questions own - OCR, reranking,
+    # the chat provider - because inheriting them is silently wrong: a target
+    # installed with -Folder never sees those questions, so it would arrive with
+    # OCR on and a chat pane pointed at an Ollama on somebody else's localhost.
+    # Off is the documented default; let the target choose for itself.
     $stagedEnv = Join-Path $stage '.env'
     if (Test-Path $stagedEnv) {
         $kept = Get-Content $stagedEnv |
-            Where-Object { $_ -notmatch '^\s*RAG_(REPO_MOUNT|REPO_LABEL|CHAT_API_KEY)\s*=' }
+            Where-Object { $_ -notmatch '^\s*RAG_(REPO_MOUNT|REPO_LABEL|CHAT_[A-Z_]+|OCR|RERANK)\s*=' }
         if ($kept) { Set-Content -Path $stagedEnv -Value $kept -Encoding ascii }
         else { Remove-Item $stagedEnv -Force }
-        Write-Host '    (cleared the corpus path and any chat API key)'
+        Write-Host '    (cleared the corpus, any API key, and the per-machine choices)'
     }
 
     Write-Host '==> compressing' -ForegroundColor Cyan
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    # Both assemblies: FileSystem carries ZipFile and ZipFileExtensions, while
+    # ZipArchive and ZipArchiveMode live in System.IO.Compression itself.
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    # ZipFile rather than Compress-Archive: far quicker over a few hundred MB.
-    [System.IO.Compression.ZipFile]::CreateFromDirectory(
-        $stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+    Add-Type -AssemblyName System.IO.Compression
+
+    # Entry by entry rather than CreateFromDirectory, for one reason: on Windows
+    # .NET writes the platform separator into the entry name, and the zip format
+    # requires forward slashes (APPNOTE 4.4.17.1). Explorer and .NET read
+    # "vendor\wheels\x.whl" back as a path anyway, so this is invisible here -
+    # but Python's zipfile and Linux unzip treat the backslash as an ordinary
+    # character, extracting one flat pile of oddly-named files instead of a
+    # tree. This repo ships rag-up.sh, so that case is real.
+    #
+    # ZipFile rather than Compress-Archive either way: far quicker over a few
+    # hundred megabytes.
+    $archive = [System.IO.Compression.ZipFile]::Open(
+        $zip, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $prefix = $stage.TrimEnd('\').Length + 1
+        foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force) {
+            $entry = $file.FullName.Substring($prefix).Replace('\', '/')
+            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive, $file.FullName, $entry,
+                [System.IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally {
+        $archive.Dispose()
+    }
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 
     $mb = (Get-Item $zip).Length / 1MB
