@@ -31,7 +31,9 @@ The folder is remembered in `.env`, so afterwards `Rag.bat` (or
 one invocation, which is what makes a script out of a zip runnable on a managed
 machine without changing anything on it.
 
-**The only prerequisite is Python 3.10+.** No Docker, no database server, no
+**The only prerequisite is Python 3.11+** (3.10 runs, but the offline bundle
+cannot be resolved for it — `qdrant-client`'s own dependencies need 3.11).
+No Docker, no database server, no
 model daemon - the whole stack is one Python process. The script checks for
 Python and tells you exactly what to do if it is missing.
 
@@ -1007,7 +1009,7 @@ include/exclude rules before a long first ingest.
 | Symptom | Fix |
 | --- | --- |
 | `cannot be loaded because running scripts is disabled` / `not digitally signed` | Files out of a zip carry Windows' mark-of-the-web. `Get-ChildItem -Recurse \| Unblock-File`, then `Set-ExecutionPolicy -Scope Process Bypass -Force` (that window only, no admin, machine unchanged). If group policy forbids even that: `powershell -ExecutionPolicy Bypass -File .\rag-up.ps1 -Folder "..."`. |
-| `Python 3.9+ was not found` | `winget install Python.Python.3.12`, or use `-Docker`. |
+| `Python 3.9+ was not found` | `winget install Python.Python.3.12`, or use `-Docker`. The offline bundle needs 3.11 or newer. |
 | `startup failed: Could not load model ...` | The model download needs one-time internet access to huggingface.co. Behind a proxy, set `HTTPS_PROXY` before `rag-up`. |
 | First run looks stuck | It is installing deps or downloading the model. `.\rag-up.ps1 logs`. |
 | `status: empty` | Ingest found nothing. Check `RAG_REPO_MOUNT`, then `.\rag-up.ps1 reindex`. |
