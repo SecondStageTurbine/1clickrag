@@ -21,6 +21,7 @@
   .\rag-up.ps1 -Docker          # containerised stack instead
   .\rag-up.ps1 status           # health + index size
   .\rag-up.ps1 reindex          # incremental re-ingest  (-Full to rebuild)
+  .\rag-up.ps1 setup            # revisit the optional extras (OCR, chat, reranking)
   .\rag-up.ps1 autostart        # start at logon and stay up  (-Remove to undo)
   .\rag-up.ps1 query "where is the IPC rendezvous done?"
   .\rag-up.ps1 ask "how is CHORD deployed?" -Project CHORD   # a prompt, ready for an LLM
@@ -33,8 +34,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('up', 'status', 'query', 'ask', 'reindex', 'autostart', 'bundle',
-                 'package', 'logs', 'down')]
+    [ValidateSet('up', 'setup', 'status', 'query', 'ask', 'reindex', 'autostart',
+                 'bundle', 'package', 'logs', 'down')]
     [string]$Command = 'up',
 
     [Parameter(Position = 1)]
@@ -101,6 +102,207 @@ function Set-Corpus {
 
     Write-Host "==> corpus set to $corpus" -ForegroundColor Cyan
     Write-Host '    (remembered in rag\.env - future runs need no -Folder)'
+}
+
+function Set-EnvValue {
+    # Rewrite one key in rag\.env, leaving every other line alone. An empty
+    # value removes the key rather than writing a blank one, so "not set" and
+    # "set to nothing" stay distinguishable.
+    param([string]$Key, [string]$Value)
+
+    $envPath = Join-Path $PSScriptRoot '.env'
+    $keep = @()
+    if (Test-Path $envPath) {
+        $pattern = '^\s*' + [regex]::Escape($Key) + '\s*='
+        $keep = Get-Content $envPath | Where-Object { $_ -notmatch $pattern }
+    }
+    if ($Value -ne '') { $keep += "$Key=$Value" }
+    Set-Content -Path $envPath -Value $keep -Encoding ascii
+}
+
+function Read-YesNo {
+    param([string]$Prompt, [bool]$Default)
+
+    if ($Default) { $hint = '[Y/n]' } else { $hint = '[y/N]' }
+    while ($true) {
+        $answer = Read-Host "$Prompt $hint"
+        if (-not $answer) { return $Default }
+        $answer = $answer.Trim().ToLower()
+        if ($answer -eq 'y' -or $answer -eq 'yes') { return $true }
+        if ($answer -eq 'n' -or $answer -eq 'no') { return $false }
+        Write-Host '    answer y or n' -ForegroundColor Yellow
+    }
+}
+
+function Test-CorpusHasScans {
+    # Does this corpus hold anything OCR would help with? Asking about scanned
+    # pages in a folder of Markdown wastes the one question budget this has.
+    # Deliberately bounded: `Select-Object -First 1` stops the pipeline on the
+    # first hit, so a share with a million files costs one match, not a walk.
+    param([string]$Path)
+
+    foreach ($pattern in @('*.pdf', '*.cbz')) {
+        try {
+            $hit = Get-ChildItem -LiteralPath $Path -Recurse -File -Filter $pattern `
+                -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { return $true }
+        } catch { }
+    }
+    return $false
+}
+
+function Find-LocalOllama {
+    # The common case for a local model, and the one worth detecting: if a host
+    # is already serving models there is no reason to make anyone type a URL.
+    foreach ($url in @('http://127.0.0.1:11434')) {
+        try {
+            $tags = Invoke-RestMethod "$url/api/tags" -TimeoutSec 3
+            $names = @($tags.models | ForEach-Object { $_.name })
+            if ($names.Count -gt 0) {
+                return [pscustomobject]@{ Url = $url; Models = $names }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Invoke-Setup {
+    <#
+      The optional extras, asked once at install time.
+
+      Everything here defaults to off, and each default is deliberate: they
+      cost time, money or a system change that nobody should discover after
+      the fact. But off-by-default settings buried in a .env file are, in
+      practice, off forever - so the install asks, states the cost in a line,
+      and takes Enter for an answer.
+
+      Answers are written to rag\.env either way. Recording a "no" as an
+      explicit 0 is the point: it is a decision, not an absence, and it is
+      why this does not ask again on every start.
+    #>
+    $corpus = Get-ConfiguredCorpus
+
+    Write-Host ''
+    Write-Host '==> optional extras' -ForegroundColor Cyan
+    Write-Host '    All of these are off by default. Press Enter to take the'
+    Write-Host '    suggestion in brackets; change your mind later with'
+    Write-Host '    .\rag-up.ps1 setup, or by editing rag\.env.'
+    Write-Host ''
+
+    # --- reranking --------------------------------------------------------
+    Write-Host '  Reranking' -ForegroundColor White
+    Write-Host '    Reads each candidate passage against your question and reorders'
+    Write-Host '    them. Fixes "topically similar, but not the answer", which better'
+    Write-Host '    chunking cannot. Costs a second or two per search, no reindex.'
+    if (Read-YesNo '    Turn reranking on?' $true) {
+        Set-EnvValue 'RAG_RERANK' '1'
+        Write-Host '    on' -ForegroundColor Green
+    } else {
+        Set-EnvValue 'RAG_RERANK' '0'
+        Write-Host '    off' -ForegroundColor DarkGray
+    }
+    Write-Host ''
+
+    # --- OCR --------------------------------------------------------------
+    # Only worth asking when the corpus actually holds pages that might be
+    # images. On a folder of Markdown the question is noise.
+    if ($corpus -and (Test-CorpusHasScans -Path $corpus)) {
+        Write-Host '  OCR for scanned pages' -ForegroundColor White
+        Write-Host '    Your folder has PDFs. If any of their pages are scans or'
+        Write-Host '    photographs, the words are pixels and index as nothing - a'
+        Write-Host '    search then finds nothing whether or not the answer is there.'
+        Write-Host '    Reading them is slow: about 3 seconds a page, so a few thousand'
+        Write-Host '    scanned pages is an overnight first index. Pages that already'
+        Write-Host '    have real text are untouched, and it never redoes a file.'
+        if (Read-YesNo '    Read scanned pages?' $false) {
+            Set-EnvValue 'RAG_OCR' '1'
+            Write-Host '    on - the first index will take a while' -ForegroundColor Green
+        } else {
+            Set-EnvValue 'RAG_OCR' '0'
+            Write-Host '    off - the log will say how many pages were skipped' -ForegroundColor DarkGray
+        }
+        Write-Host ''
+    }
+
+    # --- the chat pane ----------------------------------------------------
+    Write-Host '  Chat pane' -ForegroundColor White
+    Write-Host '    Search always works on its own. A chat tab additionally writes'
+    Write-Host '    cited answers, using a model you supply - this ships with none.'
+    $ollama = Find-LocalOllama
+    if ($ollama) {
+        $shown = ($ollama.Models | Select-Object -First 6) -join ', '
+        Write-Host "    Found Ollama on this machine: $shown"
+        Write-Host '    Nothing would leave this machine.'
+        if (Read-YesNo '    Use it for chat?' $true) {
+            $model = Read-Host "    Which model? [$($ollama.Models[0])]"
+            if (-not $model) { $model = $ollama.Models[0] }
+            Set-EnvValue 'RAG_CHAT_PROVIDER' 'ollama'
+            Set-EnvValue 'RAG_CHAT_URL' $ollama.Url
+            Set-EnvValue 'RAG_CHAT_MODEL' $model.Trim()
+            Write-Host "    on - $model" -ForegroundColor Green
+        } else {
+            Set-EnvValue 'RAG_CHAT_PROVIDER' ''
+            Write-Host '    off' -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host '    No local model found on this machine.'
+        if (Read-YesNo '    Point it at one now?' $false) {
+            Write-Host '    1) Claude          2) OpenAI-compatible   3) Ollama elsewhere'
+            $pick = Read-Host '    Which? [1/2/3]'
+            switch ($pick.Trim()) {
+                '1' {
+                    Set-EnvValue 'RAG_CHAT_PROVIDER' 'anthropic'
+                    $model = Read-Host '    Model? [claude-opus-5]'
+                    if (-not $model) { $model = 'claude-opus-5' }
+                    Set-EnvValue 'RAG_CHAT_MODEL' $model.Trim()
+                    $key = Read-Host '    API key'
+                    if ($key) { Set-EnvValue 'RAG_CHAT_API_KEY' $key.Trim() }
+                    Write-Host '    on - note your questions and the matching passages' -ForegroundColor Yellow
+                    Write-Host '    will be sent to api.anthropic.com' -ForegroundColor Yellow
+                }
+                '2' {
+                    Set-EnvValue 'RAG_CHAT_PROVIDER' 'openai'
+                    $url = Read-Host '    Base URL? [https://api.openai.com/v1]'
+                    if (-not $url) { $url = 'https://api.openai.com/v1' }
+                    Set-EnvValue 'RAG_CHAT_URL' $url.Trim()
+                    $model = Read-Host '    Model name'
+                    if ($model) { Set-EnvValue 'RAG_CHAT_MODEL' $model.Trim() }
+                    $key = Read-Host '    API key (blank if the server needs none)'
+                    if ($key) { Set-EnvValue 'RAG_CHAT_API_KEY' $key.Trim() }
+                    Write-Host '    on' -ForegroundColor Green
+                }
+                '3' {
+                    Set-EnvValue 'RAG_CHAT_PROVIDER' 'ollama'
+                    $url = Read-Host '    Ollama URL? [http://127.0.0.1:11434]'
+                    if (-not $url) { $url = 'http://127.0.0.1:11434' }
+                    Set-EnvValue 'RAG_CHAT_URL' $url.Trim()
+                    $model = Read-Host '    Model name'
+                    if ($model) { Set-EnvValue 'RAG_CHAT_MODEL' $model.Trim() }
+                    Write-Host '    on' -ForegroundColor Green
+                }
+                default {
+                    Write-Host '    skipped' -ForegroundColor DarkGray
+                }
+            }
+        } else {
+            Write-Host '    off - the Chat tab stays hidden' -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ''
+
+    # --- autostart --------------------------------------------------------
+    # Asked last because it is the only answer that changes anything outside
+    # this folder.
+    Write-Host '  Start automatically' -ForegroundColor White
+    Write-Host '    Registers a Windows task so the index is running whenever you are'
+    Write-Host '    logged in, and comes back if it stops. Without it the index only'
+    Write-Host '    keeps up with your documents while this window is open.'
+    Write-Host '    Undo any time with .\rag-up.ps1 autostart -Remove.'
+    $wantsAutostart = Read-YesNo '    Start at logon?' $false
+    Write-Host ''
+
+    Write-Host '==> saved to rag\.env' -ForegroundColor Cyan
+    return $wantsAutostart
 }
 
 function Get-ConfiguredCorpus {
@@ -755,7 +957,8 @@ switch ($Command) {
     'up' {
         # First run with no corpus: ask, rather than silently indexing whatever
         # directory this folder happens to sit in.
-        if (-not (Get-ConfiguredCorpus)) {
+        $firstRun = -not (Get-ConfiguredCorpus)
+        if ($firstRun) {
             if ($NoPrompt -or -not [Environment]::UserInteractive) {
                 Write-Error 'no corpus configured. Pass -Folder "C:\path\to\documents".'
             }
@@ -765,8 +968,32 @@ switch ($Command) {
             $picked = Select-CorpusFolder
             if (-not $picked) { Write-Error 'no folder chosen - nothing to index.' }
             Set-Corpus -Path $picked
+
+            # The optional extras, while the corpus is known and before the
+            # first index starts - OCR in particular has to be decided now,
+            # because turning it on afterwards means indexing the scans again.
+            $wantsAutostart = Invoke-Setup
+            if ($wantsAutostart) { Register-Autostart }
         }
         if ($Docker) { Start-DockerStack } else { Start-Native }
+    }
+
+    'setup' {
+        # The same questions the first run asks, for changing your mind. Note
+        # that turning OCR on here does not reach back into what is already
+        # indexed: `reindex` picks up the scans that were skipped.
+        if ($NoPrompt -or -not [Environment]::UserInteractive) {
+            Write-Error 'setup needs an interactive console. Edit rag\.env instead.'
+        }
+        if (-not (Get-ConfiguredCorpus)) {
+            Write-Host 'No corpus set yet - run .\rag-up.ps1 first, or pass -Folder.' -ForegroundColor Yellow
+        }
+        $wantsAutostart = Invoke-Setup
+        if ($wantsAutostart) { Register-Autostart }
+        Write-Host ''
+        Write-Host 'Restart to apply: .\rag-up.ps1 down, then .\rag-up.ps1'
+        Write-Host 'If you turned OCR on, follow that with .\rag-up.ps1 reindex'
+        Write-Host 'to read the scanned pages that were skipped before.'
     }
 
     'status' {

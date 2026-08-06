@@ -7,7 +7,10 @@ entity graph, indexer, HTTP API and a browser UI - one command, no accounts, no
 API keys, no cloud, nothing leaves the box.
 
 **Windows: double-click `Rag.bat`.** It asks which folder of documents to make
-searchable, then does everything else. That is the whole setup.
+searchable, then runs through the handful of extras that are off by default -
+reranking, OCR for scanned pages, a chat pane, starting at logon - one line
+each, Enter to take the suggestion. Then it does everything else. That is the
+whole setup, and `.\rag-up.ps1 setup` revisits those answers later.
 
 Or from a PowerShell prompt, if you prefer naming the folder up front:
 
@@ -210,6 +213,7 @@ holds a [chat pane](#chat-in-the-browser), if a generator is configured.
 ```powershell
 .\rag-up.ps1 query "where is the IPC rendezvous done?"
 .\rag-up.ps1 ask "how does the boot handoff work?"   # the same hits as a ready prompt
+.\rag-up.ps1 setup            # revisit the optional extras: OCR, chat, reranking
 .\rag-up.ps1 status
 .\rag-up.ps1 autostart        # start at logon and stay up (-Remove to undo)
 .\rag-up.ps1 reindex          # only re-embeds what changed; -Full rebuilds
