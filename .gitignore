@@ -19,5 +19,12 @@ vendor/
 # Packages produced by `rag-up package`.
 *.zip
 
+# Runtime state: this machine's process id and its logs, which name this
+# machine's paths. `rag-up package` already keeps them out of the zip; this
+# keeps them out of commits.
+*.log
+*.err
+rag.pid
+
 __pycache__/
 *.pyc

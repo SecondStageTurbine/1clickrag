@@ -44,7 +44,7 @@
   .dot.ok { background: #2ea043; } .dot.warn { background: #d29922; } .dot.bad { background: #da3633; }
   main { max-width: 1000px; margin: 0 auto; padding: 20px; }
   form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
-  input, select, button {
+  input, select, button, textarea {
     font: inherit; color: var(--text); background: var(--panel);
     border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px;
   }
@@ -109,12 +109,68 @@
   .tip dt { font-weight: 650; margin-top: 7px; }
   .tip dt:first-child { margin-top: 0; }
   .tip dd { margin: 1px 0 0; color: var(--muted); }
+
+  /* --- mode tabs --------------------------------------------------------- */
+  .tabs { display: inline-flex; gap: 2px; background: var(--panel); border: 1px solid var(--border); border-radius: 9px; padding: 2px; }
+  .tabs button {
+    background: transparent; color: var(--muted); border: none; font-weight: 600;
+    font-size: 13px; padding: 5px 13px; border-radius: 7px;
+  }
+  .tabs button[aria-selected="true"] { background: var(--accent); color: #fff; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+
+  /* --- chat -------------------------------------------------------------- */
+  .destination {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    border: 1px solid var(--border); border-radius: 9px; background: var(--panel);
+    padding: 9px 12px; font-size: 12.5px; color: var(--muted); margin-bottom: 14px;
+  }
+  .destination b { color: var(--text); font-weight: 600; }
+  .destination .where { font-family: var(--mono); font-size: 11.5px; }
+  /* A remote generator means every question and every retrieved passage leaves
+     this machine. That is a legitimate choice and a surprising one, so it is
+     stated on the page rather than left in a config file. */
+  .destination.remote { border-color: #d29922; }
+  .destination.remote .flag { color: #d29922; font-weight: 600; }
+  .turn { margin-bottom: 16px; }
+  .turn .who { font-size: 11.5px; font-weight: 650; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; margin-bottom: 5px; }
+  .turn.user .body {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 13px; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .turn.assistant .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .turn.assistant .body code {
+    background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .turn.error .body { color: #da3633; }
+  .cite {
+    display: inline-block; min-width: 17px; text-align: center; cursor: pointer;
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px;
+    font-family: var(--mono); font-size: 11px; line-height: 15px; padding: 0 4px;
+    color: var(--accent); vertical-align: baseline; margin: 0 1px;
+  }
+  .cite:hover { border-color: var(--accent); }
+  .caret { display: inline-block; width: 7px; height: 7px; background: var(--muted); border-radius: 50%; animation: blink 1s steps(2) infinite; vertical-align: baseline; }
+  @keyframes blink { 50% { opacity: 0; } }
+  details.sources { margin-top: 10px; }
+  details.sources > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+  details.sources ol { margin: 8px 0 0; padding-left: 26px; }
+  details.sources li { font-family: var(--mono); font-size: 12px; margin-bottom: 4px; color: var(--muted); }
+  details.sources li.lit { color: var(--accent); }
+  details.sources li b { color: var(--text); font-weight: 600; }
+  .composer { display: flex; gap: 8px; align-items: flex-end; }
+  .composer textarea { flex: 1 1 auto; resize: vertical; min-height: 44px; max-height: 220px; }
 </style>
 </head>
 <body>
 <header>
   <div class="bar">
     <h1>Local RAG</h1>
+    <div class="tabs" role="tablist">
+      <button type="button" id="tab-search" role="tab" aria-selected="true">Search</button>
+      <button type="button" id="tab-chat" role="tab" aria-selected="false" hidden>Chat</button>
+    </div>
     <div id="status"><span class="dot"></span><span id="status-text">checking…</span></div>
     <div style="flex:1"></div>
     <button class="ghost" id="reindex" type="button">Re-index</button>
@@ -122,8 +178,9 @@
 </header>
 
 <main>
-  <form id="form">
-    <input id="q" placeholder="Ask semantically — e.g. where is the IPC rendezvous done?" autofocus>
+  <!-- Shared by both modes: what to retrieve, and how. The question box and
+       the button below differ; these do not. -->
+  <div class="filters">
     <select id="lang" title="Language filter">
       <option value="">any language</option>
       <option value="rs">rs</option>
@@ -169,17 +226,45 @@
         </dl>
       </span></span>
     </span>
-    <button id="go" type="submit">Search</button>
-  </form>
-  <p class="hint">
-    Semantic search — best for “where is X done?”. With <b>keyword</b> on, exact
-    strings are found too, so <code>grep</code> is only needed for files outside the
-    index. <b>Hops</b> pulls in files connected by a shared name — the other places
-    a function, part number or project is mentioned. Same index the API serves on
-    <code>POST /search</code> and <code>/search/full</code>.
-  </p>
-  <div id="meta" class="meta" hidden></div>
-  <div id="results"></div>
+  </div>
+
+  <section id="pane-search">
+    <form id="form">
+      <input id="q" placeholder="Ask semantically — e.g. where is the IPC rendezvous done?" autofocus>
+      <button id="go" type="submit">Search</button>
+    </form>
+    <p class="hint">
+      Semantic search — best for “where is X done?”. With <b>keyword</b> on, exact
+      strings are found too, so <code>grep</code> is only needed for files outside the
+      index. <b>Hops</b> pulls in files connected by a shared name — the other places
+      a function, part number or project is mentioned. Same index the API serves on
+      <code>POST /search</code> and <code>/search/full</code>.
+    </p>
+    <div id="meta" class="meta" hidden></div>
+    <div id="results"></div>
+  </section>
+
+  <section id="pane-chat" hidden>
+    <div class="destination" id="destination"></div>
+    <div id="transcript"></div>
+    <p class="hint" id="chat-hint">
+      Answers are written from the passages this index retrieves, and cite them —
+      click a <span class="cite">1</span> to see which document it came from. The
+      filters above apply to what gets retrieved for each question. Nothing is
+      stored: reloading the page starts a new conversation.
+    </p>
+    <div class="composer">
+      <textarea id="msg" rows="1" placeholder="Ask about the indexed documents — Enter to send, Shift+Enter for a new line"></textarea>
+      <button id="send" type="button">Send</button>
+      <button class="ghost" id="reset" type="button" title="Forget the conversation so far">New</button>
+    </div>
+    <p class="hint" style="margin-top:8px">
+      <label class="toggle" style="padding:4px 9px;font-size:12.5px"
+             title="Off asks the model about its own last answer without searching again — for 'shorten that' or 'what does that acronym mean'.">
+        <input type="checkbox" id="retrieve" checked> search the index for this question
+      </label>
+    </p>
+  </section>
 </main>
 
 <script>
@@ -212,6 +297,15 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => (
     {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
   ));
+}
+
+function filters() {
+  return {
+    language_filter: $('lang').value || null,
+    path_prefix: $('prefix').value.trim() || null,
+    hybrid: $('hybrid').checked,
+    hops: parseInt($('hops').value, 10) || 0,
+  };
 }
 
 function renderMeta(data) {
@@ -288,10 +382,7 @@ $('form').addEventListener('submit', async (event) => {
       body: JSON.stringify({
         query,
         top_k: parseInt($('topk').value, 10),
-        language_filter: $('lang').value || null,
-        path_prefix: $('prefix').value.trim() || null,
-        hybrid: $('hybrid').checked,
-        hops: parseInt($('hops').value, 10) || 0,
+        ...filters(),
       }),
     });
     const data = await response.json();
@@ -322,7 +413,187 @@ $('reindex').addEventListener('click', async () => {
   }, 2000);
 });
 
+/* --- chat ---------------------------------------------------------------- */
+
+// The whole conversation, since the server holds none: it is stateless by
+// design, so two tabs never share a history and a reload never resumes one.
+let history = [];
+let busy = false;
+
+function showTab(which) {
+  $('pane-search').hidden = which !== 'search';
+  $('pane-chat').hidden = which !== 'chat';
+  $('tab-search').setAttribute('aria-selected', String(which === 'search'));
+  $('tab-chat').setAttribute('aria-selected', String(which === 'chat'));
+  ($(which === 'chat' ? 'msg' : 'q')).focus();
+}
+$('tab-search').addEventListener('click', () => showTab('search'));
+$('tab-chat').addEventListener('click', () => showTab('chat'));
+
+async function loadChatConfig() {
+  let cfg;
+  try {
+    cfg = await (await fetch('/chat/config')).json();
+  } catch (e) { return; }
+  if (!cfg.enabled) return;  // tab stays hidden; search is unaffected
+  $('tab-chat').hidden = false;
+  const box = $('destination');
+  box.className = 'destination' + (cfg.local ? '' : ' remote');
+  const where = cfg.local
+    ? 'on this machine or your network'
+    : '<span class="flag">⚠ your questions and the retrieved passages leave this machine</span>';
+  box.innerHTML =
+    `<b>${escapeHtml(cfg.model || cfg.provider)}</b>` +
+    `<span class="where">${escapeHtml(cfg.endpoint)}</span>` +
+    `<span>${where}</span>` +
+    (cfg.problem ? `<span class="flag">⚠ ${escapeHtml(cfg.problem)}</span>` : '');
+}
+
+// Deliberately not a Markdown renderer. The three things a grounded answer
+// actually uses are code spans, bold, and citation markers; everything else
+// survives as written, because escaped plain text is never wrong and a
+// half-implemented parser eventually is.
+function formatAnswer(text) {
+  return escapeHtml(text)
+    .replace(/`([^`\n]+)`/g, (m, code) => `<code>${code}</code>`)
+    .replace(/\*\*([^*\n]+)\*\*/g, (m, bold) => `<b>${bold}</b>`)
+    .replace(/\[(\d{1,2})\]/g, (m, n) => `<span class="cite" data-n="${n}">${n}</span>`);
+}
+
+function sourcesHtml(sources) {
+  if (!sources || !sources.length) return '';
+  const items = sources.map((s) => {
+    const heading = s.heading ? ` <b>(${escapeHtml(s.heading)})</b>` : '';
+    return `<li data-n="${s.n}">${escapeHtml(s.citation)}${heading}</li>`;
+  }).join('');
+  return `<details class="sources"><summary>${sources.length} passage${
+    sources.length === 1 ? '' : 's'}</summary><ol>${items}</ol></details>`;
+}
+
+function addTurn(role, html, cls) {
+  const el = document.createElement('div');
+  el.className = `turn ${cls || role}`;
+  el.innerHTML =
+    `<div class="who">${role === 'user' ? 'You' : 'Answer'}</div><div class="body">${html}</div>`;
+  $('transcript').appendChild(el);
+  el.scrollIntoView({block: 'end', behavior: 'smooth'});
+  return el;
+}
+
+// Clicking a citation opens that answer's source list and highlights the line,
+// so a claim can be traced to a file and line range without leaving the page.
+$('transcript').addEventListener('click', (event) => {
+  const chip = event.target.closest('.cite');
+  if (!chip) return;
+  const turn = chip.closest('.turn');
+  const details = turn && turn.querySelector('details.sources');
+  if (!details) return;
+  details.open = true;
+  for (const li of details.querySelectorAll('li')) {
+    li.classList.toggle('lit', li.dataset.n === chip.dataset.n);
+  }
+  details.querySelector(`li[data-n="${chip.dataset.n}"]`)
+    ?.scrollIntoView({block: 'nearest'});
+});
+
+async function send() {
+  const question = $('msg').value.trim();
+  if (!question || busy) return;
+  busy = true;
+  $('send').disabled = true;
+  $('msg').value = '';
+  addTurn('user', escapeHtml(question));
+  history.push({role: 'user', content: question});
+
+  const turn = addTurn('assistant', '<span class="caret"></span>');
+  const body = turn.querySelector('.body');
+  let answer = '';
+  let sources = [];
+
+  const paint = () => {
+    body.innerHTML = formatAnswer(answer) + '<span class="caret"></span>';
+  };
+
+  try {
+    const response = await fetch('/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        messages: history,
+        top_k: parseInt($('topk').value, 10),
+        retrieve: $('retrieve').checked,
+        ...filters(),
+      }),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(`${data.error || response.statusText} — ${data.detail || ''}`);
+    }
+
+    // Server-sent events, parsed by hand: EventSource cannot POST, and this
+    // needs a request body.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let cut;
+    outer: while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      while ((cut = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, cut);
+        buffer = buffer.slice(cut + 2);
+        let name = 'message', data = '';
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('event:')) name = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+        const payload = JSON.parse(data);
+        if (name === 'sources') {
+          sources = payload.sources || [];
+        } else if (name === 'delta') {
+          answer += payload.text;
+          paint();
+        } else if (name === 'error') {
+          throw new Error(payload.error);
+        } else if (name === 'done') {
+          break outer;
+        }
+      }
+    }
+
+    if (!answer.trim()) throw new Error('the generator returned nothing');
+    body.innerHTML = formatAnswer(answer) + sourcesHtml(sources);
+    history.push({role: 'assistant', content: answer});
+  } catch (e) {
+    turn.className = 'turn error';
+    // Whatever arrived before the failure is worth keeping — a truncated
+    // answer plus the reason it stopped beats an error alone.
+    body.innerHTML = (answer ? formatAnswer(answer) + '<br><br>' : '') +
+      escapeHtml(String(e.message || e));
+    // The failed turn is dropped from the history so the next question is not
+    // sent with a dangling user message the model never answered.
+    if (history[history.length - 1]?.role === 'user') history.pop();
+  } finally {
+    busy = false;
+    $('send').disabled = false;
+    $('msg').focus();
+  }
+}
+
+$('send').addEventListener('click', send);
+$('reset').addEventListener('click', () => {
+  history = [];
+  $('transcript').innerHTML = '';
+  $('msg').focus();
+});
+$('msg').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); }
+});
+
 refreshStatus();
+loadChatConfig();
 setInterval(refreshStatus, 5000);
 </script>
 </body>

@@ -40,15 +40,18 @@ Python and tells you exactly what to do if it is missing.
 | **Exact search, fused in** | ticket IDs, part numbers, error codes — the strings embeddings are worst at — [how](#keyword-search-and-the-entity-graph) |
 | **Multi-hop** | follow a name from one document to the others mentioning it — [how](#keyword-search-and-the-entity-graph) |
 | **Reads almost anything** | PDF, Word, Excel, PowerPoint, email, HTML, code, and inside `.zip` — [formats](#what-it-can-read) |
+| **Reads scans too** | pages whose text is pixels, via OCR that needs no internet and no extra binary — [OCR](#scanned-pages-ocr) |
 | **Stays current** | a watcher for live edits, a reconcile for whatever changed while it was off — [how](#keeping-it-running-and-keeping-it-current) |
 | **Stays running** | one command registers it to start at logon and revive itself — [autostart](#autostart) |
 | **Cited answers** | `/context` returns numbered passages, cited by file, lines and section — [the "G" in RAG](#feeding-an-llm-the-g-in-rag) |
+| **A chat pane, if you want one** | point it at Claude, an OpenAI-compatible endpoint or a local model and ask questions in the browser — [chat](#chat-in-the-browser) |
 | **Nothing lost quietly** | changes are queued to disk, retried with backoff, and dead-lettered where you can see them — [how](#nothing-is-indexed-on-a-promise) |
 | **A shell client** | project-scoped questions, two query modes, one standard prompt — [PowerShell client](#the-powershell-client-rag-clientpsm1) |
 | **Travels offline** | one zip carries the code, the wheels and the models to an air-gapped PC — [taking it elsewhere](#taking-it-to-another-pc) |
 
 It runs no language model and needs none installed. It finds and cites the
-passages; whatever writes prose from them is your choice and lives outside this.
+passages; whatever writes prose from them is your choice, lives outside this,
+and is optional — with none configured, everything above works unchanged.
 
 ## What it can read
 
@@ -60,6 +63,7 @@ passages; whatever writes prose from them is your choice and lives outside this.
 | Email | `.eml`, `.msg` (Outlook) |
 | Web / markup | `.html`, `.htm`, `.xml`, `.md`, `.txt` |
 | Code & config | `.rs`, `.py`, `.c`, `.sh`, `.ps1`, `.toml`, `.yaml`, `.json`, and more |
+| Scanned pages | any PDF page with no text layer, and `.cbz` — [with OCR on](#scanned-pages-ocr) |
 
 Tables in Word, every sheet in a workbook, and slide text all become searchable
 text. PDF hits carry a `[page N]` marker and slide hits a `[slide N]` marker, so
@@ -85,6 +89,55 @@ while unbounded recursion is how a zip bomb becomes a disk-space incident.
 Guards: `RAG_ARCHIVE_MAX_BYTES` (500 MB), `RAG_ARCHIVE_MAX_MEMBERS` (2000), and
 `RAG_ARCHIVES=0` to switch it off entirely. Encrypted or corrupt entries are
 skipped with a log line, not fatal.
+
+### Scanned pages (OCR)
+
+A scanned contract, a photographed report, a comic: the words are on the page,
+but as pixels. `pypdf` returns nothing for them, so by default those pages index
+as empty — and a search that finds nothing looks identical whether the corpus
+lacks the answer or the reader could not see it. You do get a log line saying
+how many pages were skipped for having no text layer.
+
+`RAG_OCR=1` in `rag\.env` reads them. It is **off by default** because it is
+about a thousand times slower than reading a text layer — seconds per page
+against microseconds — and starting a multi-hour job on someone's first index
+unasked would be indefensible. Measured on a webtoon corpus here: **2.8 s and
+~500 characters per page at 0.83 mean confidence**, so ~5,000 pages is about
+four hours, once. Modification times mean a later reconcile never redoes it;
+`reindex -Full` does, so avoid that on a scanned corpus.
+
+Only pages **with no text layer** are sent to OCR, so a typed report with
+scanned appendices costs OCR on the appendices alone. Turning it on also makes
+`.cbz` comic archives readable — those are page images and nothing else.
+
+Two things decide whether the output is usable, and both are the opposite of
+the obvious setting:
+
+- **Pages are rendered at native resolution, never upscaled.** Rendering a
+  720px-wide page at 2× made recognition slower *and* worse — 1.44 s against
+  0.32 s, confidence 0.77 against 0.81. There is no extra detail to find in an
+  upsampled bitmap, only more pixels to search.
+- **Tall pages are sliced into bands, not shrunk to fit.** A webtoon page can be
+  20,000 pixels tall; squeezing that into the detector's window flattens the
+  text to a couple of hundred pixels wide. The same page came back as
+  `LMNG CANNOTENTERUN-ESS SNENPERWSSICNBY` squashed and
+  `LIVING CANNOT ENTER UNLESS GIVEN PERMISSION BY` sliced, for 20% more time.
+  Bands also arrive in reading order, which one whole-page pass does not
+  guarantee. `RAG_OCR_BAND` and `RAG_OCR_OVERLAP` tune it; the overlap stops a
+  line falling in a cut from being lost, and the duplicate it creates is
+  removed by comparing letters only, so `EXPECTED THIS` and `EXPECTEDTHIS` count
+  as one.
+
+`RAG_OCR_MIN_CONFIDENCE` (0.5) drops low-scoring readings, which matters on
+artwork: a detector pointed at a drawing finds "text" in hatching and panel
+borders. Raise it if junk gets in, lower it if faint scans are missed.
+
+The engine is RapidOCR on the onnxruntime this already uses for embeddings, and
+its models ride inside its own wheel — so an offline install gains OCR without
+fetching anything, and the bundle grows by about 65 MB. **Expect stylised text
+to be imperfect.** Comic lettering and sound effects are among the harder cases;
+`THE HLNTER GUILD'S` is a real line of output. It is good enough to search, not
+to reprint.
 
 **Adding a file type needs no code** if it is already plain text:
 
@@ -149,7 +202,8 @@ and are reused.
 
 **Browser** — <http://127.0.0.1:49404>. Query box, language and path-prefix
 filters, a keyword toggle, a hops selector with a when-to-use guide, live index
-status, and a re-index button. Results show which arms found them.
+status, and a re-index button. Results show which arms found them. A second tab
+holds a [chat pane](#chat-in-the-browser), if a generator is configured.
 
 **Shell**
 
@@ -185,6 +239,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/search` | POST | Ranked hits, snippet-truncated |
 | `/search/full` | POST | Ranked hits, full chunk text |
 | `/context` | POST | The same hits, assembled into a citable block for a generator |
+| `/chat` | POST | A cited answer, streamed. 501 unless a generator is configured |
+| `/chat/config` | GET | Which generator is configured, and where it sends the passages |
 | `/queue` | GET | Pending, retrying and dead-lettered index work |
 | `/queue/retry` | POST | Requeue dead letters, optionally one `path` |
 | `/entities` | GET | Names the index knows about, most-mentioned first |
@@ -637,6 +693,80 @@ Two things worth telling whoever wires up the generator:
   characters for the UI. `/context` and `/search/full` return whole chunks.
 - **`top_k` of 5-8 is the usual sweet spot.** Past that the relevant passage
   tends to drown rather than the answer improving.
+
+## Chat in the browser
+
+The Chat tab is that seam with the wiring already done: it retrieves, hands the
+passages to a model you nominate, and streams back an answer whose claims carry
+`[1]` `[2]` markers you can click to see the file and lines behind them.
+
+**It is off until you configure it**, and off is a real default rather than a
+prompt to set something up. Nothing here depends on it: with no provider set the
+tab does not appear, `POST /chat` answers 501, and search behaves exactly as it
+did before. That matters because this installs on machines with no internet and
+no local model, where a chat box that failed on every message would be worse
+than no chat box.
+
+Three kinds of generator, set in `rag\.env`:
+
+```ini
+# A model on this machine or the local network
+RAG_CHAT_PROVIDER=ollama
+RAG_CHAT_MODEL=gemma3:12b
+RAG_CHAT_URL=http://gpu-box.example.lan:11434
+
+# Anything speaking OpenAI's protocol - OpenAI and its Codex models, and
+# equally llama.cpp's server, LM Studio, vLLM, text-generation-webui
+RAG_CHAT_PROVIDER=openai
+RAG_CHAT_MODEL=gpt-4o-mini
+RAG_CHAT_URL=https://api.openai.com/v1
+RAG_CHAT_API_KEY=sk-...
+
+# Claude
+RAG_CHAT_PROVIDER=anthropic
+RAG_CHAT_MODEL=claude-opus-5
+RAG_CHAT_API_KEY=sk-ant-...
+```
+
+Restart the server after changing these. No new Python package is needed for any
+of them: all three are HTTP, spoken through the `httpx` this already depends on,
+so an offline install gains a chat pane without gaining a single wheel.
+
+**Where your documents go is printed above the conversation.** Retrieval never
+leaves this process - the index, the embeddings and the files stay here - but
+the question and the passages that answered it are sent to whatever model you
+named. For a local model that is the same machine. For a hosted API it is not,
+and the pane says so in orange, with the endpoint spelled out, because a tool
+that quietly posts a private corpus to a third party is the one failure this
+must not have. `rag-up package` strips `RAG_CHAT_API_KEY` from the zip for the
+same reason.
+
+Some details that decide whether the answers are any good:
+
+- **The answer is written from the passages, and says when they fall short.**
+  The instruction it works under is to report a retrieval miss rather than
+  answer from general knowledge - a fluent wrong answer is indistinguishable
+  from a right one, which is exactly what makes it expensive.
+- **The filters above the box apply to chat too.** Language, path prefix,
+  result count, keyword fusion and hops all shape what gets retrieved for each
+  question, so you can scope a conversation to one folder.
+- **Short follow-ups carry their subject.** "And the M10?" retrieves nothing on
+  its own, so a question under 80 characters is searched together with the
+  previous one. Crude, but it costs no extra model call and is easy to reason
+  about when the citations look wrong.
+- **Untick "search the index" for a question about the last answer.** "Shorten
+  that" or "what does that acronym mean" needs no new retrieval, and skipping it
+  keeps unrelated passages out of the prompt.
+- **Nothing is stored.** The conversation lives in the browser tab; the server
+  keeps no session, so a reload starts fresh and two tabs never collide.
+- **Give a small local model room.** `RAG_CHAT_CONTEXT_CHARS` (12000) is the
+  passage budget and `RAG_CHAT_TOP_K` (8) the passage count - lower both for a
+  model with a small context window, raise them for a large one.
+
+`POST /chat` is the same thing over HTTP if you would rather drive it yourself:
+send `{"messages": [{"role": "user", "content": "..."}]}` and read back
+server-sent events - `sources` once, then a `delta` per fragment, then `done`.
+`GET /chat/config` reports which generator is configured, or that none is.
 
 ## The PowerShell client (`rag-client.psm1`)
 

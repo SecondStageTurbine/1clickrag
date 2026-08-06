@@ -9,6 +9,8 @@ Endpoints (the JSON contract matches what this project's coders already call):
     POST /search          -> truncated snippets
     POST /search/full     -> full chunk text
     POST /context         -> hits assembled into a citable block for a generator
+    GET  /chat/config     -> which generator, if any, is configured
+    POST /chat            -> a cited answer, streamed (needs RAG_CHAT_PROVIDER)
     POST /reindex         -> {"full": bool} kick off a background re-ingest
 """
 
@@ -22,13 +24,14 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import CONFIG, corpus_warning
 from .embedder import make_embedder
 from .graph import open_graph
 from .ingest import remove_paths, run_ingest
+from .llm import LlmError, make_provider
 from .queue import WorkQueue
 from .reranker import Reranker
 from .store import Store
@@ -61,6 +64,9 @@ graph = open_graph(CONFIG)
 # Durable record of work the watcher has seen. Opened eagerly so a restart
 # reports what it inherited rather than discovering it later.
 queue = WorkQueue(CONFIG.queue_path, max_attempts=CONFIG.queue_max_attempts)
+# The chat pane's generator, or None when none is configured - which is the
+# default. Search does not depend on it in any way.
+llm = make_provider(CONFIG)
 
 STATE: dict = {
     "ingest_running": False,
@@ -655,6 +661,212 @@ def context(request: ContextRequest):
         "chunks_dropped_for_budget": dropped,
         "chars": used,
     }
+
+
+SYSTEM_PROMPT = """You answer questions about a private collection of documents.
+
+The numbered passages attached to each question are the retrieved evidence, and
+the only view you have of the collection. Answer from them, and cite the passage
+each claim rests on as [1], [2] - a reader checking your answer has the citation
+and nothing else.
+
+Say plainly when the passages do not answer the question. A retrieval miss is a
+normal outcome and a useful one to report; an answer assembled from general
+knowledge reads exactly like a correct one, which is what makes it costly. When
+the passages answer part of the question, give that part and name what is
+missing.
+
+Quote exact strings - identifiers, part numbers, dates, names - rather than
+paraphrasing them, and keep the answer as long as the question needs."""
+
+
+def _retrieval_query(messages: list[dict]) -> str:
+    """What to search for, given the conversation so far.
+
+    The last user message, except when it is short enough to be a follow-up
+    ("what about the other one?", "why?"), which on its own retrieves nothing
+    useful. Those carry their subject in the previous turn, so it is prepended.
+    A crude rule, but it costs no model call and is easy to reason about when
+    the citations look wrong.
+    """
+    users = [m["content"].strip() for m in messages if m["role"] == "user"]
+    if not users:
+        return ""
+    latest = users[-1]
+    if len(latest) < 80 and len(users) > 1:
+        return f"{users[-2]}\n{latest}"
+    return latest
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    # Whole conversation, oldest first. The server holds no session state: a
+    # reload starts a new conversation, and two browsers cannot tread on each
+    # other's history.
+    messages: list[ChatMessage]
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    language_filter: str | None = None
+    path_prefix: str | None = None
+    hybrid: bool | None = None
+    hops: int | None = Field(default=None, ge=0, le=3)
+    expand: bool | None = None
+    # Off asks the generator without retrieval, for a follow-up about the
+    # answer itself ("shorten that", "what does that acronym mean") where a
+    # fresh search would only crowd the prompt.
+    retrieve: bool = True
+
+
+@app.get("/chat/config")
+def chat_config():
+    """Whether chat is available, and where the documents would go.
+
+    The destination is reported rather than assumed: this indexes private
+    material, and "which host am I about to send it to" is the question anyone
+    running it should be able to answer before typing.
+    """
+    if llm is None:
+        return {
+            "enabled": False,
+            "detail": "no generator configured - set RAG_CHAT_PROVIDER in rag/.env",
+        }
+    return {
+        "enabled": True,
+        "provider": llm.name,
+        "model": llm.model,
+        "endpoint": llm.endpoint,
+        "local": llm.local,
+        # A reachability check, not a promise: the model can still be missing
+        # or the key rejected at the moment of asking.
+        "problem": llm.check(),
+    }
+
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    """A cited answer, streamed as server-sent events.
+
+    Retrieval happens here and the passages are attached to the newest user
+    message, so the system prompt stays byte-identical between turns and the
+    evidence sits next to the question it answers.
+
+    Events: `sources` once, then `delta` per fragment, then `done`; `error`
+    replaces the rest if something fails. Errors arrive on the stream rather
+    than as a status code because the failure usually happens after the
+    response has started, when the status is already 200.
+    """
+    if llm is None:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "error": "chat is not configured",
+                "detail": (
+                    "set RAG_CHAT_PROVIDER (anthropic, openai or ollama) in "
+                    "rag/.env - search works without it"
+                ),
+            },
+        )
+
+    history = [
+        {"role": m.role, "content": m.content}
+        for m in request.messages
+        if m.role in ("user", "assistant") and m.content.strip()
+    ]
+    if not history or history[-1]["role"] != "user":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "the last message must be from the user"},
+        )
+
+    # Retrieve before opening the stream: a retrieval failure should be an
+    # ordinary status code, not an error event inside a 200.
+    context_block = ""
+    sources: list[dict] = []
+    ranking: list[str] = []
+    graph_used = None
+    if request.retrieve:
+        found = context(
+            ContextRequest(
+                query=_retrieval_query(history),
+                top_k=request.top_k or CONFIG.chat_top_k,
+                language_filter=request.language_filter,
+                path_prefix=request.path_prefix,
+                hybrid=request.hybrid,
+                hops=request.hops,
+                expand=request.expand,
+                max_chars=CONFIG.chat_context_chars,
+            )
+        )
+        if isinstance(found, JSONResponse):
+            return found
+        context_block = found["context"]
+        sources = found["sources"]
+        ranking = found.get("ranking", [])
+        graph_used = found.get("graph")
+
+    # Older turns are replayed for pronouns and follow-ups, but their
+    # passages are not: re-sending every turn's evidence would fill the
+    # context window with retrieval nobody asked about again.
+    turns = history[-(CONFIG.chat_history_turns + 1):]
+    question = turns[-1]["content"]
+    if context_block:
+        turns = turns[:-1] + [{
+            "role": "user",
+            "content": (
+                f"{question}\n\n"
+                f"Retrieved passages:\n\n{context_block}"
+            ),
+        }]
+    elif request.retrieve:
+        turns = turns[:-1] + [{
+            "role": "user",
+            "content": (
+                f"{question}\n\n"
+                "Retrieved passages: none - the search returned nothing for "
+                "this question. Say so rather than answering from general "
+                "knowledge."
+            ),
+        }]
+
+    def event(name: str, payload: dict) -> str:
+        # json.dumps also does the SSE framing work: it escapes the newlines
+        # that would otherwise end the data field early.
+        return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+    def stream():
+        yield event("sources", {
+            "sources": sources,
+            "ranking": ranking,
+            "graph": graph_used,
+            "provider": llm.name,
+            "model": llm.model,
+        })
+        try:
+            for fragment in llm.stream(SYSTEM_PROMPT, turns):
+                if fragment:
+                    yield event("delta", {"text": fragment})
+        except LlmError as exc:
+            yield event("error", {"error": str(exc)})
+            return
+        except Exception as exc:  # a bug here must not look like a hung stream
+            log.exception("chat failed")
+            yield event("error", {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        yield event("done", {})
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Nothing proxies this today, but a buffering proxy is exactly
+            # what turns a streamed answer back into a long silence.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 class NeighbourRequest(BaseModel):

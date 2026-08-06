@@ -22,3 +22,14 @@ openpyxl>=3.1,<4       # .xlsx / .xlsm
 xlrd>=2,<3             # legacy .xls
 striprtf>=0.0.26,<1    # .rtf
 extract-msg>=0.54,<1   # Outlook .msg
+
+# OCR, for pages whose text is pixels: scans, photographed reports, comics.
+# Optional at runtime like the readers above - without them a scanned PDF is
+# skipped with a log line rather than failing - and off by default (RAG_OCR=1).
+# RapidOCR runs on the onnxruntime fastembed already pulls in, and its models
+# ride inside its own wheel, so this adds no download to an offline install.
+# opencv ships one abi3 wheel covering every interpreter; pypdfium2 renders the
+# page, which pypdf cannot do.
+rapidocr-onnxruntime>=1.2,<2
+pypdfium2>=4,<6
+Pillow>=10,<12

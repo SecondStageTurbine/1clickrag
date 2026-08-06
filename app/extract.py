@@ -16,7 +16,10 @@ import csv
 import io
 import logging
 import os
+import zipfile
 from html.parser import HTMLParser
+
+from .config import CONFIG
 
 log = logging.getLogger("rag.extract")
 
@@ -27,7 +30,13 @@ DOCUMENT_EXTS = {
     ".odt", ".ods", ".odp",
     ".rtf", ".eml", ".msg",
     ".csv", ".tsv", ".html", ".htm", ".xml",
+    # A comic archive: a zip of page images and nothing else. Readable only
+    # with OCR on, and skipped with an explanation when it is off.
+    ".cbz",
 }
+
+# Page images inside a .cbz, in the order a reader would meet them.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
 # Legacy binary Office formats (.doc, .ppt) have no dependable pure-Python
 # reader. They are reported once rather than silently skipped, so nobody
@@ -56,6 +65,87 @@ def _cap(text: str) -> str:
     if len(text) > MAX_EXTRACTED_CHARS:
         return text[:MAX_EXTRACTED_CHARS] + "\n[... truncated ...]"
     return text
+
+
+# Counted rather than logged per file: a folder of scans would otherwise
+# produce one warning per document and bury everything else.
+_scanned_pages = 0
+_scanned_files = 0
+
+
+def _note_skipped_scan(path: str, scanned: int, total: int) -> None:
+    """Record that a document's pages were images and OCR was off.
+
+    Worth a line, because the alternative is an index that silently omits
+    whole documents - and a search that finds nothing looks identical whether
+    the corpus lacks the answer or the reader could not see it.
+    """
+    global _scanned_pages, _scanned_files
+    _scanned_pages += scanned
+    _scanned_files += 1
+    if _scanned_files == 1:
+        log.warning(
+            "%s has %d/%d page(s) with no text layer - they are images. "
+            "Set RAG_OCR=1 in rag/.env to read them (slow: seconds per page).",
+            path, scanned, total,
+        )
+    elif _scanned_files % 50 == 0:
+        log.warning(
+            "%d files / %d pages skipped so far for having no text layer "
+            "(RAG_OCR=1 to read them)",
+            _scanned_files, _scanned_pages,
+        )
+
+
+def scan_report() -> tuple[int, int]:
+    """Files and pages skipped for having no text layer, since start."""
+    return _scanned_files, _scanned_pages
+
+
+def from_cbz(path: str) -> str | None:
+    """A comic archive: page images in a zip, readable only through OCR."""
+    if not CONFIG.ocr:
+        _note_skipped_scan(path, 1, 1)
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        _missing("Pillow", "Pillow", path)
+        return None
+    from . import ocr as ocr_module
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = sorted(
+                name for name in archive.namelist()
+                if os.path.splitext(name)[1].lower() in IMAGE_EXTS
+                and not name.endswith("/")
+            )
+            if not names:
+                return None
+            if len(names) > CONFIG.archive_max_members:
+                names = names[: CONFIG.archive_max_members]
+            log.info("OCR: %s - reading %d page image(s)", path, len(names))
+            parts: list[str] = []
+            for number, name in enumerate(names, start=1):
+                try:
+                    with archive.open(name) as handle:
+                        image = Image.open(io.BytesIO(handle.read())).convert("RGB")
+                except Exception as exc:
+                    log.debug("could not read %s!%s: %s", path, name, exc)
+                    continue
+                text = ocr_module.image_text(
+                    image,
+                    band=CONFIG.ocr_band,
+                    overlap=CONFIG.ocr_overlap,
+                    min_confidence=CONFIG.ocr_min_confidence,
+                )
+                if text.strip():
+                    parts.append(f"[page {number}]\n{text.strip()}")
+    except (zipfile.BadZipFile, OSError) as exc:
+        log.warning("could not open %s: %s", path, exc)
+        return None
+    return _cap("\n\n".join(parts)) if parts else None
 
 
 def _strip_boilerplate(pages: list[list[str]]) -> list[list[str]]:
@@ -129,6 +219,25 @@ def from_pdf(path: str) -> str | None:
         except Exception:
             text = ""
         raw_pages.append(text.split("\n"))
+
+    # Pages whose text layer is empty or near-empty are scanned images. Their
+    # words are on the page, just as pixels, and left here they would be
+    # indexed as nothing - which reads exactly like a document that does not
+    # mention the thing you searched for.
+    scanned = {
+        number
+        for number, lines in enumerate(raw_pages, start=1)
+        if len("".join(lines).strip()) < CONFIG.ocr_min_chars
+    }
+    if scanned:
+        if CONFIG.ocr:
+            from . import ocr as ocr_module
+
+            log.info("OCR: %s - reading %d page(s) of images", path, len(scanned))
+            for number, text in ocr_module.pdf_page_text(path, scanned, CONFIG).items():
+                raw_pages[number - 1] = text.split("\n")
+        else:
+            _note_skipped_scan(path, len(scanned), len(raw_pages))
 
     pages = raw_pages if os.environ.get("RAG_PDF_KEEP_BOILERPLATE") else _strip_boilerplate(raw_pages)
 
@@ -424,6 +533,7 @@ _EXTRACTORS = {
     ".tsv": from_delimited,
     ".html": from_html,
     ".htm": from_html,
+    ".cbz": from_cbz,
 }
 
 
