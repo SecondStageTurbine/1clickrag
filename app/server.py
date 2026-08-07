@@ -31,7 +31,7 @@ from .config import CONFIG, corpus_warning
 from .embedder import make_embedder
 from .graph import open_graph
 from .ingest import remove_paths, run_ingest
-from .llm import LlmError, make_provider
+from .llm import LlmError, discover, make_provider
 from .queue import WorkQueue
 from .reranker import Reranker
 from .store import Store
@@ -67,6 +67,49 @@ queue = WorkQueue(CONFIG.queue_path, max_attempts=CONFIG.queue_max_attempts)
 # The chat pane's generator, or None when none is configured - which is the
 # default. Search does not depend on it in any way.
 llm = make_provider(CONFIG)
+
+# Every generator this machine can reach, refreshed on a timer rather than per
+# request: discovery costs an HTTP call to Ollama and two PATH lookups, which
+# is nothing once and rude on every keystroke. Short enough that pulling a
+# model shows up without a restart.
+_BACKEND_TTL = 30.0
+_backends: dict = {"at": 0.0, "list": []}
+_backend_lock = threading.Lock()
+
+
+def backends(refresh: bool = False) -> list:
+    with _backend_lock:
+        stale = time.time() - _backends["at"] > _BACKEND_TTL
+        if refresh or stale or not _backends["list"]:
+            try:
+                _backends["list"] = discover(CONFIG)
+                _backends["at"] = time.time()
+            except Exception as exc:  # discovery must never break the pane
+                log.warning("backend discovery failed: %s", exc)
+        return _backends["list"]
+
+
+def pick_backend(wanted: str | None):
+    """The backend the browser asked for, or the sensible default."""
+    available = backends()
+    if wanted:
+        for provider in available:
+            if provider.id == wanted:
+                return provider
+        # Asked for something that has gone away - a model unloaded, a CLI
+        # uninstalled. Rediscover once before deciding it is really absent.
+        for provider in backends(refresh=True):
+            if provider.id == wanted:
+                return provider
+        return None
+    # No explicit choice: the configured provider if there is one, else
+    # whatever was discovered first. Taken from the discovered list rather
+    # than the module-level provider so it carries an id the browser can send
+    # back - the bare one from make_provider has never been given one.
+    for provider in available:
+        if provider.id == "configured":
+            return provider
+    return available[0] if available else None
 
 STATE: dict = {
     "ingest_running": False,
@@ -724,6 +767,35 @@ class ChatRequest(BaseModel):
     # answer itself ("shorten that", "what does that acronym mean") where a
     # fresh search would only crowd the prompt.
     retrieve: bool = True
+    # Which generator answers, by the id from GET /chat/models. None takes the
+    # default, so a caller written before this existed still works.
+    backend: str | None = None
+
+
+@app.get("/chat/models")
+def chat_models():
+    """What the dropdown offers, discovered fresh rather than configured.
+
+    A list in a config file is wrong the moment someone pulls a new model.
+    Asking Ollama what it holds and looking for the CLIs on PATH is right by
+    construction: `ollama pull deepseek-r1` and it is here on the next load.
+    """
+    available = backends()
+    chosen = pick_backend(None)
+    return {
+        "default": chosen.id if chosen else None,
+        "backends": [
+            {
+                "id": provider.id,
+                "label": provider.label or provider.model,
+                "model": provider.model,
+                "kind": provider.name,
+                "endpoint": provider.endpoint,
+                "local": provider.local,
+            }
+            for provider in available
+        ],
+    }
 
 
 @app.get("/chat/config")
@@ -734,20 +806,26 @@ def chat_config():
     material, and "which host am I about to send it to" is the question anyone
     running it should be able to answer before typing.
     """
-    if llm is None:
+    chosen = pick_backend(None)
+    if chosen is None:
         return {
             "enabled": False,
-            "detail": "no generator configured - set RAG_CHAT_PROVIDER in rag/.env",
+            "detail": (
+                "no generator found - install Ollama and pull a model, or set "
+                "RAG_CHAT_PROVIDER in rag/.env"
+            ),
         }
     return {
         "enabled": True,
-        "provider": llm.name,
-        "model": llm.model,
-        "endpoint": llm.endpoint,
-        "local": llm.local,
+        "provider": chosen.name,
+        "model": chosen.model,
+        "endpoint": chosen.endpoint,
+        "local": chosen.local,
+        "backend": chosen.id,
+        "count": len(backends()),
         # A reachability check, not a promise: the model can still be missing
         # or the key rejected at the moment of asking.
-        "problem": llm.check(),
+        "problem": chosen.check(),
     }
 
 
@@ -764,14 +842,23 @@ def chat(request: ChatRequest):
     than as a status code because the failure usually happens after the
     response has started, when the status is already 200.
     """
-    if llm is None:
+    generator = pick_backend(request.backend)
+    if generator is None:
+        if request.backend:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"no generator called '{request.backend}'",
+                    "detail": "GET /chat/models lists what is available now",
+                },
+            )
         return JSONResponse(
             status_code=501,
             content={
                 "error": "chat is not configured",
                 "detail": (
-                    "set RAG_CHAT_PROVIDER (anthropic, openai or ollama) in "
-                    "rag/.env - search works without it"
+                    "no generator found - install Ollama and pull a model, or "
+                    "set RAG_CHAT_PROVIDER in rag/.env. Search works without it"
                 ),
             },
         )
@@ -847,12 +934,18 @@ def chat(request: ChatRequest):
             "sources": sources,
             "ranking": ranking,
             "graph": graph_used,
-            "provider": llm.name,
-            "model": llm.model,
+            "provider": generator.name,
+            "model": generator.model,
+            "backend": generator.id,
         })
         try:
-            for fragment in llm.stream(SYSTEM_PROMPT, turns):
-                if fragment:
+            for fragment in generator.stream(SYSTEM_PROMPT, turns):
+                # A provider may report progress instead of answer text - a
+                # reasoning model can think for minutes before its first word,
+                # and silence for that long is indistinguishable from a hang.
+                if isinstance(fragment, dict):
+                    yield event("status", fragment)
+                elif fragment:
                     yield event("delta", {"text": fragment})
         except LlmError as exc:
             yield event("error", {"error": str(exc)})
