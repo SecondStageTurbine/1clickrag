@@ -144,6 +144,9 @@
   /* A remote generator means every question and every retrieved passage leaves
      this machine. That is a legitimate choice and a surprising one, so it is
      stated on the page rather than left in a config file. */
+  .picker { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; flex-wrap: wrap; }
+  .picker label { font-size: 12.5px; color: var(--muted); font-weight: 600; }
+  .picker select { flex: 0 1 340px; }
   .destination.remote { border-color: #d29922; }
   .destination.remote .flag { color: #d29922; font-weight: 600; }
   .turn { margin-bottom: 16px; }
@@ -166,6 +169,7 @@
   }
   .cite:hover { border-color: var(--accent); }
   .caret { display: inline-block; width: 7px; height: 7px; background: var(--muted); border-radius: 50%; animation: blink 1s steps(2) infinite; vertical-align: baseline; }
+  .thinking { color: var(--muted); font-style: italic; }
   @keyframes blink { 50% { opacity: 0; } }
   details.sources { margin-top: 10px; }
   details.sources > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
@@ -263,6 +267,10 @@
   </section>
 
   <section id="pane-chat" hidden>
+    <div class="picker">
+      <label for="backend">Answered by</label>
+      <select id="backend" title="Which model writes the answer. Retrieval is the same whichever you pick."></select>
+    </div>
     <div class="destination" id="destination"></div>
     <div id="transcript"></div>
     <p class="hint" id="chat-hint">
@@ -471,24 +479,58 @@ function showTab(which) {
 $('tab-search').addEventListener('click', () => showTab('search'));
 $('tab-chat').addEventListener('click', () => showTab('chat'));
 
+// The generators available right now, keyed by id, so the banner can describe
+// whichever one is selected without asking the server again.
+let backends = {};
+
 async function loadChatConfig() {
-  let cfg;
+  let cfg, list;
   try {
     cfg = await (await fetch('/chat/config')).json();
+    if (!cfg.enabled) return;  // tab stays hidden; search is unaffected
+    list = await (await fetch('/chat/models')).json();
   } catch (e) { return; }
-  if (!cfg.enabled) return;  // tab stays hidden; search is unaffected
   $('tab-chat').hidden = false;
+
+  const select = $('backend');
+  backends = {};
+  select.innerHTML = '';
+  for (const b of (list.backends || [])) {
+    backends[b.id] = b;
+    const option = document.createElement('option');
+    option.value = b.id;
+    // The label already says what it is; the marker is about where the
+    // documents go, which is the part worth seeing before choosing.
+    option.textContent = `${b.label}${b.local ? '' : '  — sends data off this machine'}`;
+    select.appendChild(option);
+  }
+  // A choice made once should survive a reload, but not outlive the model:
+  // fall back to the server's default if the remembered one is gone.
+  const remembered = localStorage.getItem('rag-backend');
+  select.value = (remembered && backends[remembered]) ? remembered : (list.default || '');
+  if (!select.value && select.options.length) select.selectedIndex = 0;
+  describeBackend();
+}
+
+function describeBackend() {
   const box = $('destination');
-  box.className = 'destination' + (cfg.local ? '' : ' remote');
-  const where = cfg.local
-    ? 'on this machine or your network'
+  const b = backends[$('backend').value];
+  if (!b) { box.hidden = true; return; }
+  box.hidden = false;
+  box.className = 'destination' + (b.local ? '' : ' remote');
+  const where = b.local
+    ? 'runs on this machine — nothing leaves it'
     : '<span class="flag">⚠ your questions and the retrieved passages leave this machine</span>';
   box.innerHTML =
-    `<b>${escapeHtml(cfg.model || cfg.provider)}</b>` +
-    `<span class="where">${escapeHtml(cfg.endpoint)}</span>` +
-    `<span>${where}</span>` +
-    (cfg.problem ? `<span class="flag">⚠ ${escapeHtml(cfg.problem)}</span>` : '');
+    `<b>${escapeHtml(b.model || b.label)}</b>` +
+    `<span class="where">${escapeHtml(b.endpoint)}</span>` +
+    `<span>${where}</span>`;
 }
+
+$('backend').addEventListener('change', () => {
+  localStorage.setItem('rag-backend', $('backend').value);
+  describeBackend();
+});
 
 // Deliberately not a Markdown renderer. The three things a grounded answer
 // actually uses are code spans, bold, and citation markers; everything else
@@ -563,6 +605,7 @@ async function send() {
         messages: history,
         top_k: parseInt($('topk').value, 10),
         retrieve: $('retrieve').checked,
+        backend: $('backend').value || null,
         ...filters(),
       }),
     });
@@ -593,6 +636,14 @@ async function send() {
         const payload = JSON.parse(data);
         if (name === 'sources') {
           sources = payload.sources || [];
+        } else if (name === 'status') {
+          // A reasoning model can think for minutes before its first word.
+          // Without this the pane shows a bare cursor and looks hung.
+          if (!answer) {
+            body.innerHTML =
+              `<span class="thinking">thinking${payload.chars
+                ? ` (${payload.chars.toLocaleString()} characters so far)` : ''}…</span>`;
+          }
         } else if (name === 'delta') {
           answer += payload.text;
           paint();
