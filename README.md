@@ -137,6 +137,26 @@ the obvious setting:
 artwork: a detector pointed at a drawing finds "text" in hatching and panel
 borders. Raise it if junk gets in, lower it if faint scans are missed.
 
+**A rebuild does not read the pages again.** Indexing is two jobs of wildly
+different cost — turning a PDF into text takes seconds, or minutes with OCR,
+while chunking and embedding that text takes milliseconds — and a full reindex
+used to redo both. But `reindex -Full` exists for when *chunking or embedding*
+changes, and none of those alter what the words on page 12 are. So extracted
+text is kept and reused. Measured on 12 scanned PDFs: **215s cold, 0.1s on the
+rebuild**, byte-identical output.
+
+It is keyed by the SHA-256 of the file's bytes, not its timestamp. Timestamps
+are cheaper and are what the incremental scan already trusts, but this cache
+has to survive `reindex -Full` — and distrusting timestamps is the whole reason
+someone runs that. It is keyed by the extraction settings too, so turning OCR
+on or changing its confidence bypasses the old entries without discarding them;
+switch back and they are still there. `GET /stats` reports its size and hit
+rate. The first rebuild after upgrading still pays once, since nothing is
+cached yet.
+
+Like the keyword index, it holds verbatim document text, so it is never
+committed, never packaged, and dropped by `down -Wipe`.
+
 The engine is RapidOCR on the onnxruntime this already uses for embeddings, and
 its models ride inside its own wheel — so an offline install gains OCR without
 fetching anything, and the bundle grows by about 65 MB. **Expect stylised text
