@@ -289,6 +289,23 @@ class Config:
     # exist.
     rrf_k: int = _env_int("RAG_RRF_K", 60)
 
+    # Search again using the words the documents use, when the question's own
+    # wording matches little. Deterministic and model-free - two extra BM25
+    # passes over SQLite - so it works with any chat model, or none, and helps
+    # /search and /context as much as the chat pane. See app/expand.py for why
+    # it exists: a question phrased in the reader's vocabulary can miss the
+    # passage that answers it entirely.
+    expand: bool = _env_bool("RAG_EXPAND", True)
+    # How many of the first pass's passages contribute vocabulary, and how many
+    # words are taken from them. Both small on purpose: the follow-up is meant
+    # to be a sharper query, not a wider one.
+    expand_feedback_docs: int = _env_int("RAG_EXPAND_FEEDBACK_DOCS", 5)
+    expand_terms: int = _env_int("RAG_EXPAND_TERMS", 8)
+    # A harvested word in more than this share of the corpus is furniture, not
+    # subject matter, and searching with it retrieves everything. Raise it on a
+    # corpus of unrelated documents, where any given word is rarer.
+    expand_max_share: float = float(os.environ.get("RAG_EXPAND_MAX_SHARE", "0.08"))
+
     # An entity in more than this share of the documents is boilerplate - a
     # header, a footer, the corpus's own subject - and connects everything to
     # everything. Raise it on a corpus of unrelated documents.
@@ -379,6 +396,13 @@ class Config:
     # Prior turns replayed to the generator. The retrieved passages are the
     # expensive part of each prompt, so history is kept short deliberately.
     chat_history_turns: int = _env_int("RAG_CHAT_HISTORY_TURNS", 6)
+    # How many times the model may ask for a different search before it has to
+    # answer with what it has. Retrieval matches the question's wording against
+    # the documents', and when those differ the right passage is missing
+    # entirely - this lets a model that notices say so and try the document's
+    # own vocabulary instead. Costs a full generation per round, and a model
+    # that kept searching would never answer, hence the cap. 0 disables it.
+    chat_max_searches: int = _env_int("RAG_CHAT_MAX_SEARCHES", 2)
     # Watching defaults OFF for a UNC share. SMB does not deliver change
     # notifications dependably, so the watcher would appear to work while
     # quietly missing edits - worse than not running, because the index looks

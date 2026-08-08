@@ -314,6 +314,32 @@ class Graph:
                 self._total_docs = int(row["n"]) if row else 0
             return self._total_docs
 
+    def chunk_frequency(self, terms: list[str]) -> dict[str, int]:
+        """How many chunks each term appears in.
+
+        Feedback expansion needs this to tell a word that *describes* the
+        passages it came from apart from one that is merely everywhere. Without
+        it the vocabulary harvested from a comic corpus is "it's", "that's" and
+        the studio credit printed on the last page of every chapter - present
+        in the sample for the same reason they are present in everything.
+
+        One FTS lookup per term against an index that already exists, so a
+        dozen candidates cost about as much as one search.
+        """
+        counts: dict[str, int] = {}
+        with self._lock:
+            for term in terms:
+                cleaned = term.replace('"', '""')
+                try:
+                    row = self.db.execute(
+                        "SELECT COUNT(*) AS n FROM chunk_fts WHERE chunk_fts MATCH ?",
+                        ('"' + cleaned + '"',),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    continue  # a term FTS cannot parse tells us nothing
+                counts[term] = int(row["n"]) if row else 0
+        return counts
+
     def df_ceiling(self) -> int:
         """How many documents an entity may appear in before it is boilerplate.
 
