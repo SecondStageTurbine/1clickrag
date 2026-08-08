@@ -273,6 +273,17 @@ def run_ingest(
             # it, or deleted files survive in keyword search and the graph.
             graph.clear()
 
+        if full:
+            # The one moment everything in the index provably came from one set
+            # of settings. Written here rather than at the end so a rebuild
+            # interrupted halfway is still described by what produced it - the
+            # chunks that landed did use these values.
+            from . import manifest as manifest_module
+
+            manifest_module.save(
+                cfg.manifest_path, manifest_module.current(cfg, embedder.dim)
+            )
+
         if paths is not None:
             from .archive import is_archive
 

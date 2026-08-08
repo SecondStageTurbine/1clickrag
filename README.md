@@ -974,6 +974,40 @@ with hyphenation and wrapped lines extracts worse than Markdown. `/graph/path`
 is best-effort — on prose it can route through a weak link, so read the
 evidence citations before believing a chain.
 
+## When a setting changes under a built index
+
+Several settings decide what ends up in the vectors — the embedding model, the
+chunk size, which label rides along with the text. Change one and the chunks
+already indexed keep whatever the old setting produced, while everything
+indexed afterwards uses the new one. You end up with an index built two
+different ways, and nothing says so: search keeps working and returns slightly
+worse answers, blaming nothing.
+
+So the settings are written down beside the index when it is built and checked
+against the running configuration at startup:
+
+```
+⚠ The index was built with different settings: the embedded label
+  ('symbol' -> 'section'). Chunks indexed before and after this change are not
+  comparable - run `reindex -Full` to rebuild them consistently.
+```
+
+It appears in the browser header, in the server log, and as `stale` on
+`/health`; `/stats` carries the full before-and-after detail.
+
+Two kinds of drift are distinguished, because the consequences differ. Changing
+**the model, chunk size, vector width or embedded label** makes old and new
+chunks incomparable, and only a full reindex fixes it. Changing **what gets
+extracted** — OCR, archives, extra text extensions — corrects itself file by
+file as each is next indexed, so a reindex only hurries it along. The message
+says which of the two you are looking at.
+
+Drift is reported, never repaired. Rebuilding an index is minutes to hours of
+your time and that is your call to make, not the tool's. An index built before
+this existed has no record, which is reported as unknown and never warned
+about — being nagged into a two-hour rebuild to satisfy a bookkeeping file
+would be a poor trade.
+
 ## Knowing whether a change helped
 
 Every knob here — reranking, hybrid fusion, hops, query expansion, what goes

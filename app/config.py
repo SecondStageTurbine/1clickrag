@@ -518,6 +518,14 @@ class Config:
     # The coldest entries are dropped when it is exceeded.
     extract_cache_max_mb: int = _env_int("RAG_EXTRACT_CACHE_MAX_MB", 2048)
 
+    # Where the record of what built the index lives. Compared against the
+    # running configuration at startup, so a setting that changes the vectors
+    # cannot be flipped without anybody noticing the index is now half one
+    # thing and half another.
+    manifest_path: str = os.environ.get(
+        "RAG_MANIFEST_PATH", os.path.join(_DEFAULT_DATA, "index-manifest.json")
+    )
+
     # Look inside .zip archives and index the documents they contain.
     archives: bool = _env_bool("RAG_ARCHIVES", True)
     archive_max_bytes: int = _env_int("RAG_ARCHIVE_MAX_BYTES", 500_000_000)
