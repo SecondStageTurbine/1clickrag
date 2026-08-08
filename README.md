@@ -43,14 +43,18 @@ Python and tells you exactly what to do if it is missing.
 | --- | --- |
 | **Semantic search** | ask in plain language; finds the passage, not the keyword — [tuning](#if-results-look-wrong) |
 | **Exact search, fused in** | ticket IDs, part numbers, error codes — the strings embeddings are worst at — [how](#keyword-search-and-the-entity-graph) |
+| **Asks again in the document's words** | when your wording and the page's disagree, it searches a second time using the page's — [how](#when-your-words-and-the-documents-words-differ) |
 | **Multi-hop** | follow a name from one document to the others mentioning it — [how](#keyword-search-and-the-entity-graph) |
 | **Reads almost anything** | PDF, Word, Excel, PowerPoint, email, HTML, code, and inside `.zip` — [formats](#what-it-can-read) |
 | **Reads scans too** | pages whose text is pixels, via OCR that needs no internet and no extra binary — [OCR](#scanned-pages-ocr) |
 | **Stays current** | a watcher for live edits, a reconcile for whatever changed while it was off — [how](#keeping-it-running-and-keeping-it-current) |
 | **Stays running** | one command registers it to start at logon and revive itself — [autostart](#autostart) |
 | **Cited answers** | `/context` returns numbered passages, cited by file, lines and section — [the "G" in RAG](#feeding-an-llm-the-g-in-rag) |
-| **A chat pane, if you want one** | point it at Claude, an OpenAI-compatible endpoint or a local model and ask questions in the browser — [chat](#chat-in-the-browser) |
+| **A chat pane, if you want one** | pick from a dropdown of whatever this machine has — Claude, Codex, Ollama, any OpenAI-compatible endpoint — [chat](#chat-in-the-browser) |
 | **Nothing lost quietly** | changes are queued to disk, retried with backoff, and dead-lettered where you can see them — [how](#nothing-is-indexed-on-a-promise) |
+| **Measurable** | score a retrieval change against questions you know the answers to, instead of guessing — [how](#knowing-whether-a-change-helped) |
+| **Cheap to rebuild** | a full reindex reuses the extracted text instead of re-reading every document — [how](#scanned-pages-ocr) |
+| **Says when it is stale** | change a setting that shapes the vectors and it tells you the index no longer matches — [how](#when-a-setting-changes-under-a-built-index) |
 | **A shell client** | project-scoped questions, two query modes, one standard prompt — [PowerShell client](#the-powershell-client-rag-clientpsm1) |
 | **Travels offline** | one zip carries the code, the wheels and the models to an air-gapped PC — [taking it elsewhere](#taking-it-to-another-pc) |
 
@@ -108,8 +112,9 @@ about a thousand times slower than reading a text layer — seconds per page
 against microseconds — and starting a multi-hour job on someone's first index
 unasked would be indefensible. Measured on a webtoon corpus here: **2.8 s and
 ~500 characters per page at 0.83 mean confidence**, so ~5,000 pages is about
-four hours, once. Modification times mean a later reconcile never redoes it;
-`reindex -Full` does, so avoid that on a scanned corpus.
+four hours, once — and once is the operative word. Modification times mean a
+later reconcile never redoes it, and since the extracted text is kept (below), a
+full reindex does not either.
 
 Only pages **with no text layer** are sent to OCR, so a typed report with
 scanned appendices costs OCR on the appendices alone. Turning it on also makes
@@ -266,7 +271,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/search/full` | POST | Ranked hits, full chunk text |
 | `/context` | POST | The same hits, assembled into a citable block for a generator |
 | `/chat` | POST | A cited answer, streamed. 501 unless a generator is configured |
-| `/chat/config` | GET | Which generator is configured, and where it sends the passages |
+| `/chat/config` | GET | Which generator answers by default, and where it sends the passages |
+| `/chat/models` | GET | Every generator this machine can reach, for the dropdown |
 | `/queue` | GET | Pending, retrying and dead-lettered index work |
 | `/queue/retry` | POST | Requeue dead letters, optionally one `path` |
 | `/entities` | GET | Names the index knows about, most-mentioned first |
@@ -609,8 +615,13 @@ nothing to set. Whether that beats onnxruntime's own choice is machine-specific
 and worth trying both ways if a large ingest drags.
 
 Changing the model changes the vector width, so follow it with
-`.\rag-up.ps1 reindex -Full`. Narrowing the corpus is the other lever - point
-`-Folder` at the subtree you actually search rather than a whole shared drive.
+`.\rag-up.ps1 reindex -Full` — and it will tell you if you forget, since the
+settings that built the index are [recorded and
+checked](#when-a-setting-changes-under-a-built-index). That rebuild re-embeds
+but does not re-read the documents, so on a corpus of scans it costs minutes
+rather than the hours the first pass did. Narrowing the corpus is the other
+lever — point `-Folder` at the subtree you actually search rather than a whole
+shared drive.
 
 ## When the right passage will not come top: reranking
 
@@ -723,17 +734,32 @@ Two things worth telling whoever wires up the generator:
 ## Chat in the browser
 
 The Chat tab is that seam with the wiring already done: it retrieves, hands the
-passages to a model you nominate, and streams back an answer whose claims carry
+passages to a model you pick, and streams back an answer whose claims carry
 `[1]` `[2]` markers you can click to see the file and lines behind them.
 
-**It is off until you configure it**, and off is a real default rather than a
-prompt to set something up. Nothing here depends on it: with no provider set the
-tab does not appear, `POST /chat` answers 501, and search behaves exactly as it
-did before. That matters because this installs on machines with no internet and
-no local model, where a chat box that failed on every message would be worse
-than no chat box.
+**An "Answered by" dropdown lists whatever this machine can reach**, and the
+list is discovered rather than configured — a list in a config file is wrong
+the moment someone pulls a new model. Ollama is asked what it holds and `PATH`
+is checked for signed-in coding agents, so `ollama pull deepseek-r1` puts
+Deepseek in the dropdown on the next page load with nothing to edit. Embedding
+models are filtered out: they answer `/api/chat` with nonsense rather than an
+error, and this indexer pulls one itself, so offering it was a guaranteed
+puzzle rather than a hypothetical one. Your choice is remembered across
+reloads.
 
-Three kinds of generator, set in `rag\.env`:
+**Claude Code and Codex work as backends** if they are installed. They are
+command line tools rather than HTTP services, so the server drives them as
+subprocesses — someone with a paid-up agent already on the machine should not
+have to go and find an API key to use it from the pane.
+
+**It stays hidden until there is something to use**, and that is a real default
+rather than a prompt to set something up. With nothing found, the tab does not
+appear, `POST /chat` answers 501, and search behaves exactly as it did. That
+matters because this installs on machines with no internet and no local model,
+where a chat box that failed on every message would be worse than no chat box.
+
+To point it at something the discovery cannot find — a hosted API, or a model
+on another machine — set it in `rag\.env`:
 
 ```ini
 # A model on this machine or the local network
@@ -789,10 +815,18 @@ Some details that decide whether the answers are any good:
   passage budget and `RAG_CHAT_TOP_K` (8) the passage count - lower both for a
   model with a small context window, raise them for a large one.
 
+- **A reasoning model says it is thinking.** One streams its reasoning before
+  its answer; that reasoning is not the answer and is dropped, but dropping it
+  silently made a slow model look like a hung one — minutes passing with the
+  stream alive and nothing on screen. The pane now says so.
+
 `POST /chat` is the same thing over HTTP if you would rather drive it yourself:
-send `{"messages": [{"role": "user", "content": "..."}]}` and read back
-server-sent events - `sources` once, then a `delta` per fragment, then `done`.
-`GET /chat/config` reports which generator is configured, or that none is.
+send `{"messages": [{"role": "user", "content": "..."}]}`, optionally with
+`"backend"` from the list below, and read back server-sent events — `sources`
+once, then a `delta` per fragment, then `done`, with `status` while a model
+thinks or searches again. `GET /chat/models` lists what is available and which
+answers by default; `GET /chat/config` describes that default, or reports that
+there is none.
 
 ## The PowerShell client (`rag-client.psm1`)
 
@@ -974,6 +1008,47 @@ with hyphenation and wrapped lines extracts worse than Markdown. `/graph/path`
 is best-effort — on prose it can route through a weak link, so read the
 evidence citations before believing a chain.
 
+## When your words and the document's words differ
+
+Retrieval matches the wording of your question against the wording of the
+documents. When the two disagree about the same thing, the passage that answers
+you is simply absent — and nothing says so. A manual that says "torque
+specification" does not match a question about "how tight". A status window
+lettered `DAILY QUEST` does not match a question about "the System". Every arm
+works correctly and the answer is nowhere in the results.
+
+Two things address it, and they fail differently, which is why there are two.
+
+**A deterministic pass, with no model involved.** Your question is stripped of
+its scaffolding — "what", "does", "when" — for one keyword search, then the
+vocabulary *that* pass turned up is used for another, and both are fused in as
+extra rankings. This is pseudo-relevance feedback, it costs two more BM25
+queries against SQLite, and it works with any chat model or none. It improves
+`POST /search` and `POST /context` as much as the chat pane.
+
+Which words get reused took three attempts, and the failures are worth knowing
+if you tune it. Ranking by raw frequency harvested `it's`, `that's` and the
+studio credit printed on every chapter's last page — words in the sample
+because they are in *everything*. Filtering for rarity instead produced
+`abovemep` and `actoally`: on OCR'd pages the rarest words are the scanning
+errors, each appearing once because it is not a word. What works is a band —
+common enough to have been read correctly somewhere, rare enough to still
+discriminate. `RAG_EXPAND_MAX_SHARE` is the ceiling, and there is a floor of
+three chunks underneath it.
+
+**The model can ask for a different search.** When the passages fall short it
+may reply `SEARCH: <terms>`, guessing what the documents themselves would call
+the thing; the server runs that and hands back new passages. This is the part
+that crosses a genuine vocabulary gap, which the deterministic pass cannot —
+the bridging words are in neither your question nor the first results, so no
+amount of re-reading them will produce it.
+
+It is a line of text rather than a tool API, so any instruction-following model
+can use it, including a small local one. Bounded by `RAG_CHAT_MAX_SEARCHES`
+(two) because each round costs a full generation and a model that kept
+searching would never answer. Both rounds' passages are renumbered into one
+list, so a citation in the answer still resolves against what you were shown.
+
 ## When a setting changes under a built index
 
 Several settings decide what ends up in the vectors — the embedding model, the
@@ -1131,6 +1206,10 @@ include/exclude rules before a long first ingest.
 | `python -m app.ingest` fails with a lock error | The server holds the embedded store. Re-index through it: `.\rag-up.ps1 reindex`. |
 | Want better code recall | `RAG_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code` in `.env`, then `.\rag-up.ps1 reindex -Full`. |
 | Want a smaller/faster model | `RAG_EMBED_MODEL=BAAI/bge-small-en-v1.5` (~67 MB, 384-dim), then reindex `-Full`. |
+| A warning says the index was built with different settings | A setting that shapes the vectors moved. `reindex -Full` rebuilds consistently; the message says which setting and whether it needs a rebuild at all. |
+| The Chat tab is missing | Nothing was found to answer with. Install Ollama and pull a model, or set `RAG_CHAT_PROVIDER` — `GET /chat/models` lists what it can see. |
+| Chat times out on a local model | A large model can take minutes per answer. The error names `RAG_CHAT_TIMEOUT`; raise it, or pick a smaller model from the dropdown. |
+| A question finds nothing, but you know it is in there | Your wording and the page's may not overlap. Search the words printed on the page, or widen `top_k` — and add the question to `rag-eval.json` so the fix is measurable. |
 
 Nothing here is a blocker for work: if the RAG is down, `grep` and direct file
 reads always work.
