@@ -716,7 +716,7 @@ function New-Package {
     $null = robocopy $PSScriptRoot $stage /E `
         /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant') `
             (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
-        /XF 'graph.db*' 'ingest-queue.db*' 'rag.pid' '*.log' '*.err'
+        /XF 'graph.db*' 'ingest-queue.db*' 'rag.pid' '*.log' '*.err' 'rag-eval.json'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
     # robocopy reports what it did in its exit code - 1 means "files copied",
     # which is success. Left alone it becomes the script's own exit code, so a

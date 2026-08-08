@@ -954,6 +954,61 @@ with hyphenation and wrapped lines extracts worse than Markdown. `/graph/path`
 is best-effort — on prose it can route through a weak link, so read the
 evidence citations before believing a chain.
 
+## Knowing whether a change helped
+
+Every knob here — reranking, hybrid fusion, hops, query expansion, what goes
+into the embedded text — is a judgement call, and judging one by running a few
+searches and squinting tells you almost nothing. Five questions can only tell
+you a change helped those five. The ones it quietly broke are, by definition,
+the ones nobody typed.
+
+So: a list of questions with the documents that ought to answer them.
+
+```powershell
+Copy-Item rag-eval.example.json rag-eval.json   # then edit it
+python -m app.evaluate --save before.json
+# ...change something, reindex if it touched embedding...
+python -m app.evaluate --compare before.json
+```
+
+```
+       #1 -> #1    how do I keep it running after I log out?
+ DN    #3 -> #4    which model writes the answers?
+     MISS -> #2    what does the System say when it first appears?
+
+  10 questions   hit@1 70%  hit@3 90%  hit@5 100%   MRR 0.808
+  was:           hit@1 70%  hit@3 100% hit@5 100%   MRR 0.817
+  MRR -0.008, 2 question(s) changed rank
+```
+
+**hit@k** is the share of questions with a right answer in the top k — what a
+reader experiences, since nobody reads past the first screen. **MRR** is the
+mean reciprocal rank: 1.0 if the answer is always first, 0.5 if always second.
+It sees a hit moving from rank 5 to rank 2, which hit@k cannot.
+
+No language model is involved and none is needed. This grades **retrieval** —
+whether the right passage was found — which is the half that must work before
+any generator has a chance. Grading the prose an LLM writes is a different and
+far more expensive problem, and not this one.
+
+A dozen questions you already know the answers to is enough to start. The best
+ones come from real disappointments: every time a search fails you, add it, and
+that failure can never quietly come back. Phrase them as someone would actually
+type them — a question worded the way the document is worded passes trivially
+and measures nothing.
+
+`--set` changes any search setting for the run, so a knob can be A/B'd without
+touching `.env`:
+
+```powershell
+python -m app.evaluate --set hybrid=false --save no-keyword.json
+python -m app.evaluate --compare no-keyword.json
+```
+
+Expectations are substrings matched against a result's path, section or symbol
+— not exact citations, because line ranges shift whenever chunking changes, and
+a golden set needing a rewrite after every change will not be maintained.
+
 ## If results look wrong
 
 Retrieval quality is the one thing worth tuning, and there are three dials.

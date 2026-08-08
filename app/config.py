@@ -259,6 +259,32 @@ class Config:
     # changes the vectors, so follow it with `reindex -Full`.
     embed_path: str = os.environ.get("RAG_EMBED_PATH", "full").strip().lower()
 
+    # Which label is embedded alongside the chunk's own text.
+    #   symbol  - the chunk's own first line (default)
+    #   section - the heading the chunk sits under
+    #   off     - neither
+    #
+    # `section` is the one that ought to win. It says where a passage lives,
+    # which the passage never states itself - a paragraph does not mention the
+    # chapter it is in - while `symbol` mostly repeats text the vector already
+    # holds. Prepending document and section context before embedding is the
+    # standard advice, and it is the cheap half of contextual retrieval.
+    #
+    # It was measured and it did not win. On a heading-rich corpus, ten
+    # questions phrased away from the headings' own wording: identical with
+    # reranking on (MRR 0.820 either way, no question moving a place), and
+    # slightly worse with it off (0.817 -> 0.808). The cross-encoder re-reads
+    # query and passage together, so what the vector put in eleventh place is
+    # recoverable anyway - which is presumably why the label matters so little
+    # here. On a corpus of documents without headings it cannot matter at all:
+    # `section` falls back to `symbol`.
+    #
+    # So the default stays where the evidence is, and the knob stays because
+    # ten questions on one corpus is weak evidence, not a law. Worth trying
+    # `section` on a large structured corpus with `--compare` before believing
+    # either result. Changing this changes every vector: reindex -Full after.
+    embed_label: str = os.environ.get("RAG_EMBED_LABEL", "symbol").strip().lower()
+
     # Cross-encoder reranking. The vector search retrieves `rerank_candidates`
     # and the reranker re-orders them down to top_k. Off by default: it costs a
     # second or two per query on CPU and an extra model download. Worth it when
