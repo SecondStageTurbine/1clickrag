@@ -173,11 +173,33 @@ def load_text(abs_path: str, max_bytes: int) -> str | None:
     # Imported lazily: these reach for optional third-party libraries, and
     # selftest.py must be able to walk a corpus with none of them present.
     from .archive import read_member, split_member
+    from .config import CONFIG
     from .extract import extract, is_document
+    from .extract_cache import fingerprint_file, open_cache
 
+    cache = open_cache(CONFIG)
     member = split_member(abs_path)
+
+    # Only the expensive paths are cached: extracting a document, or reaching
+    # inside an archive. Plain text is already a single read, so caching it
+    # would double the disk it occupies to save nothing.
     if member:
-        return read_member(member[0], member[1], max_bytes)
+        container, inside = member
+        if cache is None:
+            return read_member(container, inside, max_bytes)
+        # The container is hashed, not the member: opening the zip twice to
+        # fingerprint one entry would cost more than it saves, and a changed
+        # archive changes the hash for every member it holds.
+        stamp = fingerprint_file(container)
+        key = f"{stamp}:{inside}" if stamp else None
+        if key:
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+        text = read_member(container, inside, max_bytes)
+        if key and text:
+            cache.put(key, text)
+        return text
 
     try:
         if os.path.getsize(abs_path) > max_bytes:
@@ -186,5 +208,16 @@ def load_text(abs_path: str, max_bytes: int) -> str | None:
         return None
 
     if is_document(abs_path):
-        return extract(abs_path)
+        if cache is None:
+            return extract(abs_path)
+        stamp = fingerprint_file(abs_path)
+        if stamp is None:
+            return extract(abs_path)  # unreadable now; let extract() report it
+        cached = cache.get(stamp)
+        if cached is not None:
+            return cached
+        text = extract(abs_path)
+        if text:
+            cache.put(stamp, text)
+        return text
     return read_text(abs_path, max_bytes)

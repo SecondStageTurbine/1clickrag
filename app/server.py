@@ -396,12 +396,26 @@ def stats():
         "watching": CONFIG.watch,
         "rescan_minutes": CONFIG.rescan_minutes,
         "queue": queue.counts(),
+        # Whether a rebuild will have to re-read the documents or not. Worth
+        # seeing before starting one on a corpus of scans.
+        "extract_cache": _cache_stats(),
         "indexing": STATE["ingest_running"],
         "last_ingest": STATE["last_ingest"],
         "last_reconcile": STATE["last_reconcile"],
         "uptime_seconds": round(time.time() - STATE["started_at"], 1),
         "error": STATE["ingest_error"],
     }
+
+
+def _cache_stats() -> dict | None:
+    """Extraction cache size and hit rate, or None when it is off."""
+    from .extract_cache import open_cache
+
+    try:
+        cache = open_cache(CONFIG)
+        return cache.stats() if cache else None
+    except Exception:  # a reporting problem must not break /stats
+        return None
 
 
 def _citation_key(hit: dict) -> str:

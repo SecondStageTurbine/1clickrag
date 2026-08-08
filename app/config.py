@@ -496,6 +496,28 @@ class Config:
     # exhausting memory during render, not a resolution policy.
     ocr_max_megapixels: int = _env_int("RAG_OCR_MAX_MEGAPIXELS", 80)
 
+    # Keep extracted text so a rebuild need not re-read the documents. Indexing
+    # is two jobs of very different cost - turning a PDF into text takes
+    # seconds or, with OCR, minutes, while chunking and embedding that text
+    # takes milliseconds - and a full reindex used to redo both. It exists for
+    # when chunking or embedding changes, and neither of those alters what the
+    # words on the page are.
+    #
+    # Keyed by the SHA-256 of the file's bytes and by every setting that
+    # changes extraction output, so it survives `reindex -Full` (which is
+    # exactly when timestamps are not to be trusted) and invalidates itself
+    # when OCR settings change.
+    #
+    # It holds verbatim document text: never committed, never packaged, and
+    # dropped by `down -Wipe`.
+    extract_cache: bool = _env_bool("RAG_EXTRACT_CACHE", True)
+    extract_cache_path: str = os.environ.get(
+        "RAG_EXTRACT_CACHE_PATH", os.path.join(_DEFAULT_DATA, "extract-cache.db")
+    )
+    # Compressed text, so this goes a long way - prose runs about four to one.
+    # The coldest entries are dropped when it is exceeded.
+    extract_cache_max_mb: int = _env_int("RAG_EXTRACT_CACHE_MAX_MB", 2048)
+
     # Look inside .zip archives and index the documents they contain.
     archives: bool = _env_bool("RAG_ARCHIVES", True)
     archive_max_bytes: int = _env_int("RAG_ARCHIVE_MAX_BYTES", 500_000_000)
