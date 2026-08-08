@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import expand as expand_module
 from .config import CONFIG, corpus_warning
 from .embedder import make_embedder
 from .graph import open_graph
@@ -235,6 +237,9 @@ class SearchRequest(BaseModel):
     # means exactly what it meant before.
     hybrid: bool | None = None
     hops: int | None = Field(default=None, ge=0, le=3)
+    # Search again with the document's own vocabulary when the question's
+    # wording finds little. None uses the server default.
+    expand_query: bool | None = None
 
 
 def _bootstrap() -> None:
@@ -480,6 +485,7 @@ def _do_search(request: SearchRequest, truncate: bool) -> JSONResponse:
 
     rankings: list[tuple[str, list[dict]]] = [("vector", hits)]
     graph_used: dict | None = None
+    expanded_with: list[str] = []
     use_hybrid = CONFIG.hybrid if request.hybrid is None else request.hybrid
     hops = CONFIG.graph_hops if request.hops is None else request.hops
 
@@ -496,6 +502,56 @@ def _do_search(request: SearchRequest, truncate: bool) -> JSONResponse:
                     ),
                 )
             )
+
+            # Two more keyword rankings, for the case where the question and
+            # the passage that answers it share no wording. See app/expand.py:
+            # the first strips the question's scaffolding, the second takes
+            # the vocabulary the first pass turned up and searches with that.
+            expand = CONFIG.expand if request.expand_query is None else request.expand_query
+            if expand:
+                terms = expand_module.content_terms(request.query)
+                if terms and len(terms) < len(request.query.split()):
+                    rankings.append(
+                        (
+                            "terms",
+                            graph.keyword_search(
+                                " ".join(terms),
+                                top_k=wanted,
+                                language_filter=request.language_filter,
+                                path_prefix=request.path_prefix,
+                            ),
+                        )
+                    )
+
+                # Fed from what the first arms actually found - the document's
+                # own words rather than the asker's. Cheap: one more BM25 pass
+                # over SQLite, no model and no embedding.
+                seen_text = [
+                    hit["text"]
+                    for _, arm in rankings
+                    for hit in arm[: CONFIG.expand_feedback_docs]
+                ]
+                follow_up = expand_module.feedback_terms(
+                    seen_text,
+                    exclude=terms,
+                    limit=CONFIG.expand_terms,
+                    frequency=graph.chunk_frequency,
+                    corpus_chunks=graph.count_chunks(),
+                    max_share=CONFIG.expand_max_share,
+                )
+                if follow_up:
+                    expanded_with = follow_up
+                    rankings.append(
+                        (
+                            "feedback",
+                            graph.keyword_search(
+                                " ".join(follow_up),
+                                top_k=wanted,
+                                language_filter=request.language_filter,
+                                path_prefix=request.path_prefix,
+                            ),
+                        )
+                    )
         if hops > 0:
             # Multi-hop: resolve the names in the question to entities, walk
             # out `hops` steps, and add every chunk mentioning anything reached.
@@ -557,6 +613,11 @@ def _do_search(request: SearchRequest, truncate: bool) -> JSONResponse:
         "ranking": [name for name, _ in rankings] + (["rerank"] if reranker else []),
         "results": results,
     }
+    if expanded_with:
+        # Shown rather than kept internal: when an answer comes from a passage
+        # sharing no words with the question, "how did it get there" is the
+        # first thing worth being able to check.
+        payload["expanded_with"] = expanded_with
     if graph_used:
         payload["graph"] = graph_used
     return JSONResponse(content=payload)
@@ -729,6 +790,101 @@ Quote exact strings - identifiers, part numbers, dates, names - rather than
 paraphrasing them, and keep the answer as long as the question needs."""
 
 
+SEARCH_PROTOCOL = """
+
+One more thing about the search. The passages were found by matching your
+question's wording against the documents, so when the two use different words
+for the same thing, the right passage can be missing entirely - a manual that
+says "torque specification" does not match a question about "how tight", and a
+page lettered DAILY QUEST does not match a question about "the System". The
+passages being wrong is therefore ordinary, and recoverable.
+
+When they do not contain the answer, and you can guess what the documents
+themselves would call it, reply with exactly:
+
+SEARCH: <words likely printed in the document>
+
+on one line, with nothing before or after it. A fresh search runs and you get
+new passages. Use the document's likely vocabulary rather than the question's,
+and prefer distinctive nouns to a rephrased question. If the passages do answer
+the question, ignore all of this and just answer."""
+
+LAST_ROUND = """
+
+These passages are what the search found, including any follow-up searches you
+asked for. Answer from them now. If they still do not contain the answer, say
+so plainly and say what they do cover - that is a useful reply, and better than
+a guess dressed up as one."""
+
+# A directive is one short line and nothing else. Anything longer is an answer
+# that happens to discuss searching, and treating that as a command would eat
+# the response - so the length cap matters as much as the prefix.
+_SEARCH_LINE = re.compile(r"^\s*(?:>|\*|-)?\s*SEARCH\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _search_directive(text: str) -> str | None:
+    """The query a model is asking for, or None if this is an answer."""
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    if len(first) > 160:
+        return None
+    match = _SEARCH_LINE.match(first)
+    if not match:
+        return None
+    wanted = match.group(1).strip().strip('"').strip()
+    # A bare "SEARCH:" is not a query, and a whole sentence is the model
+    # narrating rather than searching.
+    return wanted if 2 <= len(wanted) <= 120 else None
+
+
+def _merge_context(block_a: str, sources_a: list[dict],
+                   block_b: str, sources_b: list[dict],
+                   max_chars: int) -> tuple[str, list[dict]]:
+    """Both rounds' passages as one numbered block.
+
+    Renumbered from one rather than appended, because the model cites by
+    number and two independently numbered lists would make [2] ambiguous -
+    and the browser resolves those numbers against the list it was sent.
+    """
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for source in list(sources_a) + list(sources_b):
+        if source["citation"] in seen:
+            continue
+        seen.add(source["citation"])
+        merged.append(dict(source))
+
+    by_citation: dict[str, str] = {}
+    for block in (block_a, block_b):
+        for piece in block.split("\n\n["):
+            piece = piece if piece.startswith("[") else "[" + piece
+            head = piece.split("\n", 1)
+            if len(head) != 2:
+                continue
+            label = head[0].split("] ", 1)
+            if len(label) != 2:
+                continue
+            citation = label[1].split(" (")[0].strip()
+            by_citation.setdefault(citation, head[1])
+
+    parts: list[str] = []
+    kept: list[dict] = []
+    used = 0
+    for source in merged:
+        body = by_citation.get(source["citation"])
+        if body is None:
+            continue
+        heading = f" ({source['heading']})" if source.get("heading") else ""
+        number = len(kept) + 1
+        text = f"[{number}] {source['citation']}{heading}\n{body}"
+        if used + len(text) > max_chars and parts:
+            break
+        parts.append(text)
+        source["n"] = number
+        kept.append(source)
+        used += len(text) + 2
+    return "\n\n".join(parts), kept
+
+
 def _retrieval_query(messages: list[dict]) -> str:
     """What to search for, given the conversation so far.
 
@@ -874,16 +1030,11 @@ def chat(request: ChatRequest):
             content={"error": "the last message must be from the user"},
         )
 
-    # Retrieve before opening the stream: a retrieval failure should be an
-    # ordinary status code, not an error event inside a 200.
-    context_block = ""
-    sources: list[dict] = []
-    ranking: list[str] = []
-    graph_used = None
-    if request.retrieve:
+    def retrieve(query: str):
+        """One retrieval pass. Returns (block, sources, ranking, graph)."""
         found = context(
             ContextRequest(
-                query=_retrieval_query(history),
+                query=query,
                 top_k=request.top_k or CONFIG.chat_top_k,
                 language_filter=request.language_filter,
                 path_prefix=request.path_prefix,
@@ -895,34 +1046,41 @@ def chat(request: ChatRequest):
         )
         if isinstance(found, JSONResponse):
             return found
-        context_block = found["context"]
-        sources = found["sources"]
-        ranking = found.get("ranking", [])
-        graph_used = found.get("graph")
+        return (found["context"], found["sources"],
+                found.get("ranking", []), found.get("graph"))
+
+    # Retrieve before opening the stream: a retrieval failure should be an
+    # ordinary status code, not an error event inside a 200.
+    context_block = ""
+    sources: list[dict] = []
+    ranking: list[str] = []
+    graph_used = None
+    if request.retrieve:
+        first = retrieve(_retrieval_query(history))
+        if isinstance(first, JSONResponse):
+            return first
+        context_block, sources, ranking, graph_used = first
 
     # Older turns are replayed for pronouns and follow-ups, but their
     # passages are not: re-sending every turn's evidence would fill the
     # context window with retrieval nobody asked about again.
-    turns = history[-(CONFIG.chat_history_turns + 1):]
-    question = turns[-1]["content"]
-    if context_block:
-        turns = turns[:-1] + [{
-            "role": "user",
-            "content": (
-                f"{question}\n\n"
-                f"Retrieved passages:\n\n{context_block}"
-            ),
-        }]
-    elif request.retrieve:
-        turns = turns[:-1] + [{
-            "role": "user",
-            "content": (
+    base_turns = history[-(CONFIG.chat_history_turns + 1):]
+    question = base_turns[-1]["content"]
+
+    def with_passages(block: str) -> list[dict]:
+        """The conversation with this round's evidence on the newest turn."""
+        if block:
+            body = f"{question}\n\nRetrieved passages:\n\n{block}"
+        elif request.retrieve:
+            body = (
                 f"{question}\n\n"
                 "Retrieved passages: none - the search returned nothing for "
                 "this question. Say so rather than answering from general "
                 "knowledge."
-            ),
-        }]
+            )
+        else:
+            body = question
+        return base_turns[:-1] + [{"role": "user", "content": body}]
 
     def event(name: str, payload: dict) -> str:
         # json.dumps also does the SSE framing work: it escapes the newlines
@@ -930,6 +1088,8 @@ def chat(request: ChatRequest):
         return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
 
     def stream():
+        nonlocal context_block, sources, ranking, graph_used
+
         yield event("sources", {
             "sources": sources,
             "ranking": ranking,
@@ -938,22 +1098,102 @@ def chat(request: ChatRequest):
             "model": generator.model,
             "backend": generator.id,
         })
-        try:
-            for fragment in generator.stream(SYSTEM_PROMPT, turns):
-                # A provider may report progress instead of answer text - a
-                # reasoning model can think for minutes before its first word,
-                # and silence for that long is indistinguishable from a hang.
-                if isinstance(fragment, dict):
-                    yield event("status", fragment)
-                elif fragment:
-                    yield event("delta", {"text": fragment})
-        except LlmError as exc:
-            yield event("error", {"error": str(exc)})
-            return
-        except Exception as exc:  # a bug here must not look like a hung stream
-            log.exception("chat failed")
-            yield event("error", {"error": f"{type(exc).__name__}: {exc}"})
-            return
+
+        # The model may answer, or it may ask for a different search. It can
+        # only ask a bounded number of times: a model that keeps searching
+        # rather than answering would otherwise never stop, and each round
+        # costs a full generation.
+        searches_left = CONFIG.chat_max_searches if request.retrieve else 0
+        turns = with_passages(context_block)
+        tried: list[str] = []
+        exhausted = False
+
+        while True:
+            # Recomputed every round, and that is the point: once the budget is
+            # spent the protocol has to come *out* of the prompt. Leaving it in
+            # invites another directive that can no longer be honoured, and an
+            # unhonoured directive is streamed to the reader as the answer -
+            # which is exactly what "SEARCH: YOU HAVE MET THE QUALIFICATIONS"
+            # appearing in the pane looked like.
+            prompt = SYSTEM_PROMPT + (SEARCH_PROTOCOL if searches_left else LAST_ROUND)
+            directive, opening, rest = None, "", None
+            try:
+                # Read just enough to tell an answer from a search request.
+                # A directive is short and comes first, so a line's worth is
+                # always enough - and buffering only that keeps the answer's
+                # streaming intact in the ordinary case.
+                head = generator.stream(prompt, turns)
+                buffer = ""
+                for fragment in head:
+                    if isinstance(fragment, dict):
+                        yield event("status", fragment)
+                        continue
+                    buffer += fragment
+                    if "\n" in buffer or len(buffer) > 120:
+                        break
+                directive = _search_directive(buffer)
+                opening, rest = buffer, head
+            except LlmError as exc:
+                yield event("error", {"error": str(exc)})
+                return
+            except Exception as exc:
+                log.exception("chat failed")
+                yield event("error", {"error": f"{type(exc).__name__}: {exc}"})
+                return
+
+            # A directive with no budget left is not an answer either. Drop it
+            # and generate once more without the protocol, rather than showing
+            # the reader a command meant for the server.
+            if directive and searches_left <= 0:
+                if not exhausted:
+                    exhausted = True
+                    turns = with_passages(context_block)
+                    continue
+                directive = None
+
+            if directive and searches_left > 0 and directive not in tried:
+                searches_left -= 1
+                tried.append(directive)
+                yield event("status", {"searching": directive})
+                again = retrieve(directive)
+                if isinstance(again, JSONResponse):
+                    break  # index went away mid-answer; answer from what we had
+                block, more, ranking, graph_used = again
+                # Both rounds' passages, renumbered once, so a citation in the
+                # final answer still points at something in the list the
+                # browser was given.
+                context_block, sources = _merge_context(
+                    context_block, sources, block, more, CONFIG.chat_context_chars
+                )
+                yield event("sources", {
+                    "sources": sources, "ranking": ranking, "graph": graph_used,
+                    "provider": generator.name, "model": generator.model,
+                    "backend": generator.id,
+                })
+                turns = with_passages(context_block)
+                continue
+
+            # An answer. Flush what was buffered, then stream the remainder.
+            if opening:
+                yield event("delta", {"text": opening})
+            try:
+                for fragment in rest:
+                    # A provider may report progress instead of answer text - a
+                    # reasoning model can think for minutes before its first
+                    # word, and silence that long looks like a hang.
+                    if isinstance(fragment, dict):
+                        yield event("status", fragment)
+                    elif fragment:
+                        yield event("delta", {"text": fragment})
+            except LlmError as exc:
+                yield event("error", {"error": str(exc)})
+                return
+            except Exception as exc:  # a bug must not look like a hung stream
+                log.exception("chat failed")
+                yield event("error", {"error": f"{type(exc).__name__}: {exc}"})
+                return
+            break
+
         yield event("done", {})
 
     return StreamingResponse(
