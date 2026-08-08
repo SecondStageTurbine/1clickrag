@@ -126,14 +126,24 @@ def index_file(
         chunk.source = source
 
     # What location context goes into the vector - see Config.embed_path.
+    #
+    # Which label rides along with the text - see Config.embed_label, which
+    # also records what happened when the alternative was measured.
+    def label(chunk) -> str:
+        if cfg.embed_label == "symbol":
+            return chunk.symbol or ""
+        if cfg.embed_label == "off":
+            return ""
+        return chunk.section or chunk.symbol or ""
+
     if cfg.embed_path == "off":
         payloads = [c.text for c in chunks]
     elif cfg.embed_path == "name":
         payloads = [
-            f"{os.path.basename(c.path)}\n{c.symbol}\n\n{c.text}" for c in chunks
+            f"{os.path.basename(c.path)}\n{label(c)}\n\n{c.text}" for c in chunks
         ]
     else:
-        payloads = [f"{c.path}\n{c.symbol}\n\n{c.text}" for c in chunks]
+        payloads = [f"{c.path}\n{label(c)}\n\n{c.text}" for c in chunks]
     vectors = embedder.embed_documents(payloads, batch_size=cfg.embed_batch)
 
     store.delete_path(rel_path)

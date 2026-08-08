@@ -5,6 +5,7 @@
 # Your projects, prefixes and acronyms for the PowerShell client.
 # rag-projects.example.json is the committed template.
 rag-projects.json
+rag-eval.json
 
 # The vector index and the downloaded model weights. Rebuildable from the
 # corpus, large, and never worth committing.

@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "Copy to rag-eval.json and replace these with questions about YOUR corpus.",
+    "",
+    "A dozen questions you already know the answers to is enough to start, and",
+    "far more useful than none: it turns 'this change feels better' into a",
+    "number. Add one every time a search disappoints you - a golden set built",
+    "from real failures is worth more than one invented up front.",
+    "",
+    "  question  what someone would actually type, in their words rather than",
+    "            the document's. Questions phrased in the document's own",
+    "            wording pass trivially and measure nothing.",
+    "  expect    substrings matched against the result path. Any one counts as",
+    "            a hit. Substrings rather than exact citations on purpose:",
+    "            line ranges shift whenever chunking changes, and a golden set",
+    "            needing a rewrite after every change will not be maintained.",
+    "  note      why this question is here. Future you will not remember.",
+    "",
+    "Then:  python -m app.evaluate --save before.json",
+    "       ...make a change, reindex if it touches embedding...",
+    "       python -m app.evaluate --compare before.json"
+  ],
+  "questions": [
+    {
+      "question": "how do I rotate the signing certificate?",
+      "expect": ["ops/runbook", "security/certificates"],
+      "note": "the phrase people actually use; the runbook says 'renew', not 'rotate'"
+    },
+    {
+      "question": "what is the retention period for audit logs?",
+      "expect": ["policy/data-retention"],
+      "note": "a specific fact with exactly one right source"
+    },
+    {
+      "question": "INC-4471",
+      "expect": ["incidents/2026"],
+      "note": "an exact identifier - this is what the keyword arm exists for, and it should never miss"
+    },
+    {
+      "question": "who approves an exception to the change freeze?",
+      "expect": ["policy/change-management", "ops/runbook"],
+      "note": "more than one document may legitimately answer; any is a hit"
+    },
+    {
+      "question": "why did we move off the shared database?",
+      "expect": ["decisions/adr-014"],
+      "note": "reasoning rather than a fact - the kind of question embeddings are for"
+    }
+  ]
+}
