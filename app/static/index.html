@@ -344,6 +344,11 @@ function renderCorpus(h) {
     bits.push(`<span class="tag" title="RAG_COLLECTION">${escapeHtml(h.collection)}</span>`);
   }
   if (h.warning) bits.push(`<span class="warn">${escapeHtml(h.warning)}</span>`);
+  // A setting that shapes the vectors moved since the index was built. Search
+  // still works, which is exactly why this needs saying out loud - the results
+  // are coming from chunks made two different ways and nothing else would
+  // reveal it.
+  if (h.stale) bits.push(`<span class="warn">⚠ ${escapeHtml(h.stale)}</span>`);
   box.innerHTML = bits.join(' ');
   box.hidden = false;
 }

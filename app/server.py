@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import expand as expand_module
+from . import manifest as manifest_module
 from .config import CONFIG, corpus_warning
 from .embedder import make_embedder
 from .graph import open_graph
@@ -120,7 +121,23 @@ STATE: dict = {
     "last_reconcile": None,
     "started_at": time.time(),
     "warning": None,
+    "drift": None,
+    "drift_message": None,
 }
+
+
+def check_manifest() -> None:
+    """Compare the running settings against what built the index."""
+    try:
+        recorded = manifest_module.load(CONFIG.manifest_path)
+        dim = embedder.dim if getattr(embedder, "dim", None) else None
+        result = manifest_module.drift(recorded, manifest_module.current(CONFIG, dim))
+        STATE["drift"] = result
+        STATE["drift_message"] = manifest_module.describe(result)
+        if STATE["drift_message"]:
+            log.warning("%s", STATE["drift_message"])
+    except Exception as exc:  # bookkeeping must never block a start
+        log.debug("manifest check failed: %s", exc)
 
 
 def start_queue_worker(cfg) -> threading.Thread:
@@ -286,6 +303,10 @@ def _bootstrap() -> None:
             # pay the download and the model load while a user waits.
             reranker.prepare()
 
+        # After ingest, so a first build has already written its manifest and a
+        # brand new index never reports drift against itself.
+        check_manifest()
+
         start_queue_worker(CONFIG)
         if CONFIG.watch:
             start_watcher(CONFIG, store=store, embedder=embedder, queue=queue)
@@ -365,6 +386,10 @@ def health():
         "indexing": STATE["ingest_running"],
         "error": STATE["ingest_error"],
         "warning": STATE["warning"],
+        # A setting that shapes the vectors has moved since the index was
+        # built. Not an error - search still works - but the results are being
+        # drawn from chunks made two different ways.
+        "stale": STATE["drift_message"],
     }
     # Kept for continuity with the pre-existing Ollama-backed deployment, where
     # callers looked at `.ollama`. Omitted in native mode rather than reported
@@ -399,6 +424,10 @@ def stats():
         # Whether a rebuild will have to re-read the documents or not. Worth
         # seeing before starting one on a corpus of scans.
         "extract_cache": _cache_stats(),
+        # The full detail behind /health's `stale`: which settings moved, and
+        # from what to what.
+        "manifest": manifest_module.load(CONFIG.manifest_path),
+        "drift": STATE["drift"],
         "indexing": STATE["ingest_running"],
         "last_ingest": STATE["last_ingest"],
         "last_reconcile": STATE["last_reconcile"],
