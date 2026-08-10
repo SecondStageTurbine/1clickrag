@@ -44,6 +44,7 @@ Python and tells you exactly what to do if it is missing.
 | **Semantic search** | ask in plain language; finds the passage, not the keyword — [tuning](#if-results-look-wrong) |
 | **Exact search, fused in** | ticket IDs, part numbers, error codes — the strings embeddings are worst at — [how](#keyword-search-and-the-entity-graph) |
 | **Asks again in the document's words** | when your wording and the page's disagree, it searches a second time using the page's — [how](#when-your-words-and-the-documents-words-differ) |
+| **Counts, as well as finds** | "how many forms were signed this year" is computed over the index, not guessed from a few passages — [how](#how-many-are-there) |
 | **Multi-hop** | follow a name from one document to the others mentioning it — [how](#keyword-search-and-the-entity-graph) |
 | **Reads almost anything** | PDF, Word, Excel, PowerPoint, email, HTML, code, and inside `.zip` — [formats](#what-it-can-read) |
 | **Reads scans too** | pages whose text is pixels, via OCR that needs no internet and no extra binary — [OCR](#scanned-pages-ocr) |
@@ -273,6 +274,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/chat` | POST | A cited answer, streamed. 501 unless a generator is configured |
 | `/chat/config` | GET | Which generator answers by default, and where it sends the passages |
 | `/chat/models` | GET | Every generator this machine can reach, for the dropdown |
+| `/corpus/count` | POST | How many documents match, grouped by year, folder or extension |
 | `/queue` | GET | Pending, retrying and dead-lettered index work |
 | `/queue/retry` | POST | Requeue dead letters, optionally one `path` |
 | `/entities` | GET | Names the index knows about, most-mentioned first |
@@ -1007,6 +1009,56 @@ ones (a domain in an email body, a product written in running text). PDF text
 with hyphenation and wrapped lines extracts worse than Markdown. `/graph/path`
 is best-effort — on prose it can route through a weak link, so read the
 evidence citations before believing a chain.
+
+## "How many are there?"
+
+Some questions are not about what documents say, and no amount of better
+retrieval answers them:
+
+> How many CISAR forms have been signed this year?
+
+Search returns the handful of passages most like the question. Counting needs
+every matching document and none of their text. Asked this, a chat model gets
+five chunks, correctly notices they contain no total, and says so — sometimes
+adding that it cannot see your files, which is the wrong explanation for the
+right refusal.
+
+So counts are computed over the index and handed to the model as a fact:
+
+```powershell
+$body = @{match='CISAR'; group_by='year'} | ConvertTo-Json
+Invoke-RestMethod -Uri http://127.0.0.1:49404/corpus/count -Method POST -Body $body -ContentType "application/json"
+# matched: 142, total_indexed: 5000
+# groups:  2026: 42, 2025: 60, 2024: 40
+```
+
+In the Chat tab this happens by itself — ask "how many CISAR forms were signed
+this year" and the model requests the count, the server computes it, and the
+answer quotes a number it did not have to work out. **The model is never asked
+to tally a list**: a language model counting twenty-nine filenames is a coin
+toss, and `SELECT COUNT` is not.
+
+`match` is a substring of the path, or a glob if it carries `*` or `?`.
+`group_by` takes `year`, `month`, `folder`, `extension` or `none`, and
+`path_prefix` scopes to a subtree.
+
+Three things worth knowing about what the number means:
+
+- **Documents are counted, not chunks.** One PDF is many chunks, and "how many
+  forms" means files. The distinction is invisible until it is wrong by a
+  factor of four.
+- **Dates come from filenames first.** A form archive names its files by the
+  date on the form, and `Signed - A.CISAR.20260225.pdf` was signed in 2026
+  whatever the filesystem thinks — a file copied to a new machine this year has
+  not been signed this year. Only when *no* filename in the matching set
+  carries a date does modification time get used at all, and the reply says so.
+  Files without a date are counted as `undated` rather than guessed at.
+- **It counts what is indexed**, which is not quite what is in the folder: a
+  document that failed to extract is on disk but not in the index. The reply
+  gives the indexed total alongside the match count so the two are comparable.
+
+Today's date is included in the facts given to the model, because "this year"
+is unanswerable without a clock and a model has none.
 
 ## When your words and the document's words differ
 
