@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import corpus as corpus_module
 from . import expand as expand_module
 from . import manifest as manifest_module
 from .config import CONFIG, corpus_warning
@@ -850,7 +851,20 @@ SEARCH: <words likely printed in the document>
 on one line, with nothing before or after it. A fresh search runs and you get
 new passages. Use the document's likely vocabulary rather than the question's,
 and prefer distinctive nouns to a rephrased question. If the passages do answer
-the question, ignore all of this and just answer."""
+the question, ignore all of this and just answer.
+
+Separately: a question about *how many* documents there are cannot be answered
+from passages at all, however good they are. Search returns the few passages
+most like the question; counting needs every matching document and none of
+their text. For "how many X are there", "how many were signed this year", "what
+is in folder Y", reply with exactly:
+
+COUNT: <words that appear in those documents' filenames>
+
+on one line. The count is computed over the index and given back to you exactly,
+broken down by year - do not estimate it, and do not count anything yourself.
+The words should be what the *filenames* contain, so a set of files named
+"Signed - A.CISAR.20260225.pdf" is found by COUNT: CISAR."""
 
 LAST_ROUND = """
 
@@ -862,21 +876,25 @@ a guess dressed up as one."""
 # A directive is one short line and nothing else. Anything longer is an answer
 # that happens to discuss searching, and treating that as a command would eat
 # the response - so the length cap matters as much as the prefix.
-_SEARCH_LINE = re.compile(r"^\s*(?:>|\*|-)?\s*SEARCH\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_DIRECTIVE_LINE = re.compile(
+    r"^\s*(?:>|\*|-)?\s*(SEARCH|COUNT)\s*:\s*(.+?)\s*$", re.IGNORECASE
+)
 
 
-def _search_directive(text: str) -> str | None:
-    """The query a model is asking for, or None if this is an answer."""
+def _directive(text: str) -> tuple[str, str] | None:
+    """(kind, argument) the model is asking for, or None if this is an answer."""
     first = text.strip().splitlines()[0] if text.strip() else ""
     if len(first) > 160:
         return None
-    match = _SEARCH_LINE.match(first)
+    match = _DIRECTIVE_LINE.match(first)
     if not match:
         return None
-    wanted = match.group(1).strip().strip('"').strip()
+    wanted = match.group(2).strip().strip('"').strip()
     # A bare "SEARCH:" is not a query, and a whole sentence is the model
-    # narrating rather than searching.
-    return wanted if 2 <= len(wanted) <= 120 else None
+    # narrating rather than asking.
+    if not 2 <= len(wanted) <= 120:
+        return None
+    return match.group(1).upper(), wanted
 
 
 def _merge_context(block_a: str, sources_a: list[dict],
@@ -1110,10 +1128,22 @@ def chat(request: ChatRequest):
     base_turns = history[-(CONFIG.chat_history_turns + 1):]
     question = base_turns[-1]["content"]
 
+    # Facts computed about the corpus rather than retrieved from it - counts,
+    # so far. Carried separately from the passages because they are not
+    # passages: nothing was matched to produce them and there is nothing to
+    # cite but the query itself.
+    facts: list[str] = []
+
     def with_passages(block: str) -> list[dict]:
         """The conversation with this round's evidence on the newest turn."""
+        preamble = ("\n\n".join(facts) + "\n\n") if facts else ""
         if block:
-            body = f"{question}\n\nRetrieved passages:\n\n{block}"
+            body = f"{question}\n\n{preamble}Retrieved passages:\n\n{block}"
+        elif facts:
+            body = (
+                f"{question}\n\n{preamble}"
+                "There are no retrieved passages - answer from the counts above."
+            )
         elif request.retrieve:
             body = (
                 f"{question}\n\n"
@@ -1174,7 +1204,7 @@ def chat(request: ChatRequest):
                     buffer += fragment
                     if "\n" in buffer or len(buffer) > 120:
                         break
-                directive = _search_directive(buffer)
+                directive = _directive(buffer)
                 opening, rest = buffer, head
             except LlmError as exc:
                 yield event("error", {"error": str(exc)})
@@ -1194,9 +1224,33 @@ def chat(request: ChatRequest):
                     continue
                 directive = None
 
+            # A count is not a search: it needs every matching document and
+            # none of their text, so it is computed rather than retrieved, and
+            # handed back as a fact alongside whatever passages there are.
+            if directive and directive[0] == "COUNT" and searches_left > 0 \
+                    and directive not in tried:
+                searches_left -= 1
+                tried.append(directive)
+                wanted = directive[1]
+                yield event("status", {"counting": wanted})
+                try:
+                    tally = corpus_module.count(
+                        store.indexed_state(), match=wanted, group_by="year"
+                    )
+                    facts.append(corpus_module.describe(tally))
+                    yield event("count", tally)
+                except Exception as exc:
+                    log.warning("count failed: %s", exc)
+                    facts.append(
+                        f'The corpus count for "{wanted}" could not be computed: {exc}'
+                    )
+                turns = with_passages(context_block)
+                continue
+
             if directive and searches_left > 0 and directive not in tried:
                 searches_left -= 1
                 tried.append(directive)
+                directive = directive[1]
                 yield event("status", {"searching": directive})
                 again = retrieve(directive)
                 if isinstance(again, JSONResponse):
@@ -1248,6 +1302,45 @@ def chat(request: ChatRequest):
             # what turns a streamed answer back into a long silence.
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+class CountRequest(BaseModel):
+    # A substring of the path, or a glob if it carries wildcards. Empty counts
+    # everything indexed.
+    match: str | None = None
+    path_prefix: str | None = None
+    group_by: str = Field(default="year", pattern="^(year|month|folder|extension|none)$")
+    examples: int = Field(default=5, ge=0, le=50)
+
+
+@app.post("/corpus/count")
+def corpus_count(request: CountRequest):
+    """How many documents match, grouped - not what any of them say.
+
+    Retrieval cannot answer this and no amount of tuning makes it: search
+    returns the passages most like a question, while counting needs every
+    document that matches and none of their text. Computed here so the number
+    is exact; a model asked to tally filenames is guessing.
+
+    Counts documents rather than chunks, because "how many forms" means files
+    and one PDF is many chunks.
+    """
+    if not store.exists():
+        return JSONResponse(
+            status_code=503,
+            content={"error": "nothing is indexed yet"},
+        )
+    try:
+        documents = store.indexed_state()
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    return corpus_module.count(
+        documents,
+        match=request.match,
+        path_prefix=request.path_prefix,
+        group_by=request.group_by,
+        examples=request.examples,
     )
 
 

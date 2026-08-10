@@ -170,6 +170,13 @@
   .cite:hover { border-color: var(--accent); }
   .caret { display: inline-block; width: 7px; height: 7px; background: var(--muted); border-radius: 50%; animation: blink 1s steps(2) infinite; vertical-align: baseline; }
   .thinking { color: var(--muted); font-style: italic; }
+  .counts {
+    margin-top: 10px; padding: 9px 12px; font-size: 12.5px; color: var(--muted);
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 9px;
+  }
+  .counts b { color: var(--text); font-size: 14px; }
+  .counts .by { font-family: var(--mono); font-size: 11.5px; }
+  .counts code { background: transparent; padding: 0; font-family: var(--mono); }
   @keyframes blink { 50% { opacity: 0; } }
   details.sources { margin-top: 10px; }
   details.sources > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
@@ -548,6 +555,11 @@ function formatAnswer(text) {
     .replace(/\[(\d{1,2})\]/g, (m, n) => `<span class="cite" data-n="${n}">${n}</span>`);
 }
 
+function countsHtml(counted) {
+  if (!counted.length) return '';
+  return `<div class="counts">${counted.map((c) => `<div>${c}</div>`).join('')}</div>`;
+}
+
 function sourcesHtml(sources) {
   if (!sources || !sources.length) return '';
   const items = sources.map((s) => {
@@ -597,6 +609,7 @@ async function send() {
   const body = turn.querySelector('.body');
   let answer = '';
   let sources = [];
+  let counted = [];
 
   const paint = () => {
     body.innerHTML = formatAnswer(answer) + '<span class="caret"></span>';
@@ -641,6 +654,17 @@ async function send() {
         const payload = JSON.parse(data);
         if (name === 'sources') {
           sources = payload.sources || [];
+        } else if (name === 'count') {
+          // A number the server computed over the whole index, not a passage.
+          // Shown because "142 of 5,000 documents" is the evidence for the
+          // answer, and there is no citation to click for it.
+          const g = (payload.groups || []).slice(0, 12)
+            .map((x) => `${escapeHtml(x.key)}: ${x.count}`).join(', ');
+          counted.push(
+            `<b>${payload.matched.toLocaleString()}</b> of ${
+              payload.total_indexed.toLocaleString()} documents match` +
+            (payload.match ? ` <code>${escapeHtml(payload.match)}</code>` : '') +
+            (g ? `<br><span class="by">${g}</span>` : ''));
         } else if (name === 'status') {
           // A reasoning model can think for minutes before its first word.
           // Without this the pane shows a bare cursor and looks hung.
@@ -661,7 +685,7 @@ async function send() {
     }
 
     if (!answer.trim()) throw new Error('the generator returned nothing');
-    body.innerHTML = formatAnswer(answer) + sourcesHtml(sources);
+    body.innerHTML = formatAnswer(answer) + countsHtml(counted) + sourcesHtml(sources);
     history.push({role: 'assistant', content: answer});
   } catch (e) {
     turn.className = 'turn error';
