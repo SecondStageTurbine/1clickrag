@@ -701,18 +701,23 @@ It speeds up a first index over a large corpus, which is the obvious win.
 What it does for *query* latency is less obvious, and worth spelling out
 because the intuitive answer is wrong:
 
-| | measured (CPU) |
-| --- | --- |
-| embed one short question | 33 ms |
-| rerank 10 candidates | 415 ms |
-| rerank 40 candidates (the default) | 1.3 s |
-| rerank 150 candidates | 4.5 s |
-
-Embedding the question is a rounding error — it is one short forward pass.
-Reranking is one forward pass *per retrieved candidate*, over passages of
+Embedding the question is a rounding error — one short forward pass. Reranking
+is one forward pass *per retrieved candidate*, over passages of
 `RAG_CHUNK_CHARS` each, repeated for every re-search round. So with reranking
 off a search is milliseconds and the GPU changes nothing you can feel; with it
 on, the reranker is essentially the entire cost.
+
+Measured on one box (RTX 5090, CUDA 13.3, 150 candidates), via
+`python -m app.gpucheck`:
+
+| | CPU | GPU | |
+| --- | --- | --- | --- |
+| embedding | 8.19 ms/row | 0.47 ms/row | 17.3× |
+| reranking | 1.40 s/query | 0.06 s/query | **23.4×** |
+| end-to-end `POST /search` | 12.2 s | 0.36 s | 34× |
+
+The end-to-end figure beats both component ratios because a search reranks more
+than once — the query-expansion round pays the cost again.
 
 > Until v1.10.0 this setting was `RAG_EMBED_GPU` and reached only the embedder.
 > Turning it on therefore did nothing measurable for query latency, and the
@@ -727,11 +732,23 @@ after the normal requirements:
 
 ```powershell
 pip uninstall -y onnxruntime
-pip install --force-reinstall onnxruntime-gpu
+pip install --force-reinstall "onnxruntime-gpu[cuda,cudnn]"
 ```
+
+The `[cuda,cudnn]` extras matter. The bare wheel does not bundle CUDA or cuDNN,
+and without them onnxruntime offers `CUDAExecutionProvider`, accepts it, then
+logs `Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 13.*`
+and runs on the CPU — which looks exactly like having no GPU.
 
 Match the build to the machine's CUDA: the default PyPI wheel wants CUDA 13,
 while CUDA 12 hosts need the separate index documented in `.env.example`.
+
+On Windows those extras install their DLLs under `site-packages/nvidia/*/bin`,
+which is *not* on the DLL search path — so the libraries are present, correct
+and invisible, and you get the same silent CPU fallback. The server calls
+`onnxruntime.preload_dlls()` before building any session to fix that, so this
+needs nothing from you; it is noted only because the symptom is indistinguishable
+from a missing GPU and cost a round of debugging here.
 
 **Check it actually took**, because the obvious check lies. When the driver
 libraries are missing, onnxruntime logs a warning and runs on the CPU rather

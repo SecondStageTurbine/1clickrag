@@ -54,8 +54,8 @@ class Reranker:
             kwargs = {"model_name": self.model_name, "cache_dir": self.cache_dir}
             if self.threads > 0:
                 kwargs["threads"] = self.threads
-            if self.gpu:
-                kwargs["providers"] = accel.providers(self.gpu_setting)
+            # Always explicit, both ways - see accel.chosen().
+            kwargs["providers"] = accel.chosen(self.gpu, self.gpu_setting)
             self._model = TextCrossEncoder(**kwargs)
             # Asked at load rather than trusted from config: a CUDA request that
             # fell back to CPU warns rather than raises, and reporting the

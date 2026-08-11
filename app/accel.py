@@ -45,6 +45,41 @@ def gpu_setting_name() -> str:
     return SETTING
 
 
+def preload() -> bool:
+    """Make the pip-installed CUDA libraries findable before a session is built.
+
+    onnxruntime-gpu does not bundle CUDA or cuDNN; the documented way to supply
+    them is `pip install onnxruntime-gpu[cuda,cudnn]`, which puts the DLLs in
+    site-packages/nvidia/*/bin. On Windows that directory is not on the DLL
+    search path, so the libraries end up present, correct, and invisible - and
+    onnxruntime responds by logging "Failed to create CUDAExecutionProvider.
+    Require cuDNN 9.* and CUDA 13.*" and quietly running on the CPU.
+
+    That failure deserves spelling out because from the outside it is
+    indistinguishable from having no GPU at all: the provider is still offered,
+    the session is still created, and every number reads 1.0x. It cost a full
+    round of "install the libraries, still on CPU" here before
+    onnxruntime.preload_dlls() turned out to be the entire difference.
+
+    Older builds have no preload_dlls, and a machine using a system-wide CUDA
+    does not need it, so failing here is not an error - it just leaves the DLL
+    search path as whatever it already was.
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:  # pragma: no cover - fastembed brings onnxruntime
+        return False
+    loader = getattr(ort, "preload_dlls", None)
+    if not callable(loader):
+        return False
+    try:
+        loader()
+    except Exception as exc:  # pragma: no cover - depends on the wheel
+        log.debug("onnxruntime.preload_dlls() failed: %s", exc)
+        return False
+    return True
+
+
 def providers(setting: str = "RAG_GPU") -> list[str]:
     """CUDA first, CPU behind it - never CUDA alone.
 
@@ -56,6 +91,11 @@ def providers(setting: str = "RAG_GPU") -> list[str]:
     `setting` names the variable in the warning, so someone who set the older
     RAG_EMBED_GPU is told about the name they actually used.
     """
+    # Before asking what is available, make sure the answer can be acted on:
+    # get_available_providers() reports CUDA from the wheel's own metadata, so
+    # it says yes whether or not the libraries it needs can be found.
+    preload()
+
     try:
         import onnxruntime as ort
 
@@ -73,6 +113,23 @@ def providers(setting: str = "RAG_GPU") -> list[str]:
         )
         return [CPU]
     return [CUDA, CPU]
+
+
+def chosen(gpu: bool, setting: str = SETTING) -> list[str]:
+    """The provider list to build a session with, for either answer.
+
+    The `gpu=False` half is not "pass nothing and let onnxruntime decide",
+    because on an onnxruntime-gpu build the default is CUDA first - so leaving
+    the argument off means the GPU is used whether or not it was asked for, and
+    RAG_GPU=0 fails to mean anything. Measured here: with the flag off, both
+    models still loaded onto CUDA.
+
+    Being explicit in both directions matters when something else wants the
+    card. A local LLM sharing the GPU is the usual case, and these two models
+    take about 2.7 GB between them - which is VRAM the generator does not get,
+    silently, on the strength of a setting the user believed was off.
+    """
+    return providers(setting) if gpu else [CPU]
 
 
 def active(model, requested_gpu: bool = False) -> str:
