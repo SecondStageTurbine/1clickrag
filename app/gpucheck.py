@@ -46,6 +46,8 @@ import subprocess
 import sys
 import time
 
+from . import accel
+
 ROWS = [
     f"Failure mode {index}: intermittent loss of signal on channel {index % 8}, "
     f"detected by continuity check during power-on self test"
@@ -336,6 +338,12 @@ def main() -> int:
     except ImportError:
         say("  onnxruntime is not installed")
         return 2
+    # The same call the server makes, for the same reason: pip-installed CUDA
+    # libraries sit outside the Windows DLL search path, and without this the
+    # probe would faithfully measure a fall back that only exists because the
+    # probe forgot to look where the libraries are.
+    preloaded = accel.preload()
+    report["preloaded_dlls"] = preloaded
     available = ort.get_available_providers()
     report["onnxruntime_version"] = ort.__version__
     report["providers_available"] = available

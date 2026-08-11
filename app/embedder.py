@@ -62,8 +62,8 @@ class FastEmbedEmbedder:
             kwargs = {"model_name": self.model_name, "cache_dir": self.cache_dir}
             if self.threads > 0:
                 kwargs["threads"] = self.threads
-            if self.gpu:
-                kwargs["providers"] = accel.providers(self.gpu_setting)
+            # Always explicit, both ways - see accel.chosen().
+            kwargs["providers"] = accel.chosen(self.gpu, self.gpu_setting)
             self._model = TextEmbedding(**kwargs)
             self._provider = accel.active(self._model, self.gpu)
             log.info(
