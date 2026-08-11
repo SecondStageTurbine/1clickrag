@@ -343,6 +343,37 @@ class Config:
     # "who else was involved", and noise for "what does this sentence mean".
     graph_hops: int = _env_int("RAG_GRAPH_HOPS", 0)
 
+    # --- an OpenAI-shaped embeddings service (RAG_EMBED_BACKEND=http) -------
+    # For a hosted or company-internal endpoint. The base URL, so "/embeddings"
+    # is appended: https://ai.internal/v1
+    embed_url: str = os.environ.get("RAG_EMBED_URL", "")
+    embed_api_key: str = os.environ.get("RAG_EMBED_API_KEY", "")
+    # Gateways differ: most take Authorization: Bearer <key>, some want
+    # api-key: <key> with no prefix at all.
+    embed_auth_header: str = os.environ.get("RAG_EMBED_AUTH_HEADER", "Authorization")
+    embed_auth_prefix: str = os.environ.get("RAG_EMBED_AUTH_PREFIX", "Bearer")
+    # Retrieval models are trained asymmetrically - nomic expects
+    # "search_document: " on passages and "search_query: " on questions, e5
+    # wants "passage: " and "query: ". fastembed applies these itself; a raw
+    # HTTP endpoint does not, and omitting them degrades ranking while looking
+    # like it works. Set them to whatever the endpoint's model expects.
+    embed_doc_prefix: str = os.environ.get("RAG_EMBED_DOC_PREFIX", "")
+    embed_query_prefix: str = os.environ.get("RAG_EMBED_QUERY_PREFIX", "")
+    # Inputs per request. Gateways cap this where a local model does not.
+    embed_http_batch: int = _env_int("RAG_EMBED_HTTP_BATCH", 64)
+    embed_http_timeout: float = float(os.environ.get("RAG_EMBED_HTTP_TIMEOUT", "120"))
+    # For an internal endpoint behind a corporate CA the machine does not trust
+    # yet. A real situation and a bad default, hence opt-out rather than opt-in.
+    embed_verify_tls: bool = _env_bool("RAG_EMBED_VERIFY_TLS", True)
+
+    # Run the embedding model on the GPU. Needs onnxruntime-gpu, which REPLACES
+    # the CPU onnxruntime rather than sitting beside it - so this is off by
+    # default and falls back to CPU with a warning when no CUDA provider is
+    # present, rather than refusing to start. It speeds up a first index over a
+    # large corpus; it does almost nothing for query latency, where embedding
+    # one short question is a couple of per cent of the work.
+    embed_gpu: bool = _env_bool("RAG_EMBED_GPU", False)
+
     embed_batch: int = _env_int("RAG_EMBED_BATCH", 32)
     # ONNX inference threads. Defaults to this machine's core count rather than
     # leaving onnxruntime to choose, because a portable copy lands on an unknown

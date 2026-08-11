@@ -24,11 +24,13 @@ import threading
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import classify as classify_module
 from . import corpus as corpus_module
+from . import sheet as sheet_module
 from . import expand as expand_module
 from . import manifest as manifest_module
 from .config import CONFIG, corpus_warning
@@ -369,6 +371,11 @@ def health():
         "mode": CONFIG.mode,
         "embeddings": embed_ok,
         "embed_backend": embedder.backend,
+        # What onnxruntime actually chose, not what was asked for. Asking for
+        # CUDA and silently getting CPU is the normal failure - a missing
+        # driver library logs a warning and falls back - and without this
+        # reported, a benchmark shows a 1.1x "speedup" that is CPU both times.
+        "embed_provider": getattr(embedder, "provider", None),
         "rerank": bool(reranker),
         "rerank_model": CONFIG.rerank_model if reranker else None,
         "qdrant": qdrant_ok,
@@ -1341,6 +1348,213 @@ def corpus_count(request: CountRequest):
         path_prefix=request.path_prefix,
         group_by=request.group_by,
         examples=request.examples,
+    )
+
+
+class ClassifyRequest(BaseModel):
+    # The workbook, absolute or relative to the corpus.
+    path: str
+    # Which columns hold the text the decision is about. More than one is
+    # joined; the failure mode plus its effect usually decides more than
+    # either alone.
+    columns: list[str]
+    # What to retrieve as the criteria. Retrieved once for the whole run.
+    criteria_query: str
+    labels: list[str] = Field(default_factory=lambda: ["applicable", "not applicable"])
+    unclear_label: str = "unclear"
+    sheet: str | None = None
+    id_column: str | None = None
+    # A column of known-correct answers, if the sheet has one. Turns a run into
+    # a measurement: the reply carries an agreement rate, which is how the
+    # batch size gets chosen on evidence rather than hope.
+    truth_column: str | None = None
+    batch_size: int = Field(default=25, ge=1, le=200)
+    # Batches in flight at once. Worth raising only as far as the model server
+    # can genuinely run in parallel - several GPUs serving several instances
+    # scale nearly linearly, one instance does not, and past that requests
+    # simply queue.
+    concurrency: int = Field(default=1, ge=1, le=32)
+    # Stop after this many rows. Use it before committing to sixteen thousand.
+    limit: int = Field(default=0, ge=0)
+    criteria_chars: int = Field(default=6000, ge=500, le=40_000)
+    backend: str | None = None
+
+
+CLASSIFY: dict = {
+    "running": False, "started_at": None, "finished_at": None,
+    "done": 0, "total": 0, "stage": "", "error": None,
+    "request": None, "result": None, "cancel": False,
+}
+
+
+@app.post("/classify")
+def classify_start(request: ClassifyRequest):
+    """Decide one question about every row of a spreadsheet.
+
+    A bulk job living inside a service built for interactive search, so it is
+    deliberately one at a time and on a worker thread: search stays answerable
+    while sixteen thousand rows are being judged, and two of these cannot fight
+    over the same model.
+    """
+    if CLASSIFY["running"]:
+        return JSONResponse(status_code=409, content={"error": "a classification is already running"})
+
+    generator = pick_backend(request.backend)
+    if generator is None:
+        return JSONResponse(
+            status_code=501,
+            content={"error": "no generator configured", "detail": "GET /chat/models"},
+        )
+
+    path = request.path
+    if not os.path.isabs(path):
+        path = os.path.join(CONFIG.repo_path, path)
+    if not os.path.isfile(path):
+        return JSONResponse(status_code=404, content={"error": f"no such file: {path}"})
+
+    try:
+        rows, headers = sheet_module.read_rows(path, request.sheet, request.limit)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if not rows:
+        return JSONResponse(status_code=400, content={"error": "the sheet has no data rows"})
+
+    missing = [c for c in request.columns if c not in headers]
+    if missing:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"no such column(s): {', '.join(missing)}",
+                     "detail": f"available: {', '.join(headers)}"},
+        )
+
+    # The criteria, once. This is the change that matters most: every row was
+    # retrieving substantially the same passages, and judging every row against
+    # identical wording is worth more than the time it saves.
+    found = context(ContextRequest(
+        query=request.criteria_query,
+        top_k=CONFIG.chat_top_k,
+        max_chars=request.criteria_chars,
+    ))
+    if isinstance(found, JSONResponse):
+        return found
+    criteria = found["context"]
+    if not criteria.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "the criteria search found nothing",
+                     "detail": f"nothing matched {request.criteria_query!r} - "
+                               f"is the defining document indexed?"},
+        )
+
+    cases = classify_module.build_cases(rows, request.columns)
+    CLASSIFY.update({
+        "running": True, "started_at": time.time(), "finished_at": None,
+        "done": 0, "total": len(cases), "stage": "classifying", "error": None,
+        "cancel": False, "result": None,
+        "request": {**request.model_dump(), "resolved_path": path},
+    })
+
+    def ask(prompt: str) -> str:
+        parts = []
+        for fragment in generator.stream("", [{"role": "user", "content": prompt}]):
+            if isinstance(fragment, str):
+                parts.append(fragment)
+        return "".join(parts)
+
+    def worker() -> None:
+        try:
+            classify_module.classify_cases(
+                cases, criteria, request.labels, ask,
+                batch_size=request.batch_size,
+                unclear=request.unclear_label,
+                on_progress=lambda done, total: CLASSIFY.update({"done": done, "total": total}),
+                should_stop=lambda: CLASSIFY["cancel"],
+                concurrency=request.concurrency,
+            )
+            CLASSIFY["result"] = classify_module.results(
+                rows, cases, request.id_column, request.truth_column
+            )
+            CLASSIFY["result"]["sources"] = found["sources"]
+            CLASSIFY["stage"] = "done"
+        except classify_module.Cancelled:
+            CLASSIFY["stage"] = "cancelled"
+            # Partial work is still work: keep what was decided before the stop.
+            CLASSIFY["result"] = classify_module.results(
+                rows, cases, request.id_column, request.truth_column
+            )
+        except Exception as exc:
+            log.exception("classification failed")
+            CLASSIFY["error"] = f"{type(exc).__name__}: {exc}"
+            CLASSIFY["stage"] = "failed"
+        finally:
+            CLASSIFY["running"] = False
+            CLASSIFY["finished_at"] = time.time()
+
+    threading.Thread(target=worker, name="rag-classify", daemon=True).start()
+    return {
+        "started": True,
+        "rows": len(rows),
+        "distinct_cases": len(cases),
+        # Reported up front because it predicts the runtime better than the row
+        # count does, and it is the number people are surprised by.
+        "repeats_collapsed": len(rows) - len(cases),
+        "criteria_chars": len(criteria),
+        "model": generator.model,
+    }
+
+
+@app.get("/classify")
+def classify_status(verdicts: bool = False):
+    """Progress, and the verdicts once there are any."""
+    state = {key: value for key, value in CLASSIFY.items() if key != "result"}
+    elapsed = None
+    if CLASSIFY["started_at"]:
+        end = CLASSIFY["finished_at"] or time.time()
+        elapsed = round(end - CLASSIFY["started_at"], 1)
+    state["elapsed_seconds"] = elapsed
+    if elapsed and CLASSIFY["done"]:
+        rate = CLASSIFY["done"] / elapsed
+        state["cases_per_second"] = round(rate, 2)
+        remaining = max(CLASSIFY["total"] - CLASSIFY["done"], 0)
+        state["eta_seconds"] = round(remaining / rate) if rate else None
+
+    result = CLASSIFY["result"]
+    if result:
+        state["summary"] = {k: v for k, v in result.items() if k != "verdicts"}
+        if verdicts:
+            state["verdicts"] = result["verdicts"]
+    return state
+
+
+@app.post("/classify/cancel")
+def classify_cancel():
+    """Stop after the batch in flight, keeping what has been decided."""
+    if not CLASSIFY["running"]:
+        return {"cancelled": False, "detail": "nothing is running"}
+    CLASSIFY["cancel"] = True
+    return {"cancelled": True}
+
+
+@app.get("/classify/csv")
+def classify_csv():
+    """The verdicts as a CSV, carrying the columns that identify a row."""
+    result = CLASSIFY["result"]
+    if not result:
+        return JSONResponse(status_code=404, content={"error": "no results yet"})
+    request = CLASSIFY["request"] or {}
+    try:
+        rows, _ = sheet_module.read_rows(
+            request.get("resolved_path", ""), request.get("sheet"), request.get("limit", 0)
+        )
+    except ValueError:
+        rows = []
+    carry = [c for c in ([request.get("id_column")] if request.get("id_column") else [])
+             + list(request.get("columns") or []) if c]
+    body = sheet_module.to_csv(result["verdicts"], rows, carry)
+    return Response(
+        content=body,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="verdicts.csv"'},
     )
 
 

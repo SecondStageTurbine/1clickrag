@@ -45,6 +45,7 @@ Python and tells you exactly what to do if it is missing.
 | **Exact search, fused in** | ticket IDs, part numbers, error codes — the strings embeddings are worst at — [how](#keyword-search-and-the-entity-graph) |
 | **Asks again in the document's words** | when your wording and the page's disagree, it searches a second time using the page's — [how](#when-your-words-and-the-documents-words-differ) |
 | **Counts, as well as finds** | "how many forms were signed this year" is computed over the index, not guessed from a few passages — [how](#how-many-are-there) |
+| **Judges a spreadsheet** | apply one policy to every row of a 16,000-line sheet, with the criterion recorded per verdict — [how](#deciding-one-thing-about-every-row-of-a-spreadsheet) |
 | **Multi-hop** | follow a name from one document to the others mentioning it — [how](#keyword-search-and-the-entity-graph) |
 | **Reads almost anything** | PDF, Word, Excel, PowerPoint, email, HTML, code, and inside `.zip` — [formats](#what-it-can-read) |
 | **Reads scans too** | pages whose text is pixels, via OCR that needs no internet and no extra binary — [OCR](#scanned-pages-ocr) |
@@ -275,6 +276,10 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/chat/config` | GET | Which generator answers by default, and where it sends the passages |
 | `/chat/models` | GET | Every generator this machine can reach, for the dropdown |
 | `/corpus/count` | POST | How many documents match, grouped by year, folder or extension |
+| `/classify` | POST | Decide one question about every row of a spreadsheet |
+| `/classify` | GET | Progress, rate and summary; `?verdicts=true` for the rows |
+| `/classify/cancel` | POST | Stop after the batch in flight, keeping what was decided |
+| `/classify/csv` | GET | The verdicts as a CSV |
 | `/queue` | GET | Pending, retrying and dead-lettered index work |
 | `/queue/retry` | POST | Requeue dead letters, optionally one `path` |
 | `/entities` | GET | Names the index knows about, most-mentioned first |
@@ -615,6 +620,65 @@ RAG_EMBED_THREADS=0                        # hand thread choice back to onnxrunt
 Threads already default to the machine's core count, so there is usually
 nothing to set. Whether that beats onnxruntime's own choice is machine-specific
 and worth trying both ways if a large ingest drags.
+
+### Somebody else's embedding service
+
+`RAG_EMBED_BACKEND=http` points the index at an OpenAI-shaped `/embeddings`
+endpoint — hosted, or a company-internal gateway — instead of the in-process
+model:
+
+```ini
+# .env
+RAG_EMBED_BACKEND=http
+RAG_EMBED_URL=https://ai.internal/v1
+RAG_EMBED_MODEL=whatever-the-service-calls-it
+RAG_EMBED_API_KEY=...
+RAG_EMBED_DOC_PREFIX=search_document:
+RAG_EMBED_QUERY_PREFIX=search_query:
+```
+
+Those last two matter more than they look. Strong retrieval models are trained
+asymmetrically — nomic expects `search_document:` on passages and
+`search_query:` on questions, e5 wants `passage:` and `query:`. `fastembed`
+applies them for you; a raw HTTP endpoint does not, so leaving them empty
+against such a model degrades ranking while appearing to work. Set them to
+whatever the service's model was trained with.
+
+Replies are sorted by the `index` the server reports rather than by arrival,
+because responses are not guaranteed to come back in order and a shuffled one
+would attach every vector to the wrong chunk — nothing would error, search
+would simply return nonsense. Batches are capped (`RAG_EMBED_HTTP_BATCH`) and
+retried with backoff, since an ingest against a rate-limited gateway is the
+case this has to survive rather than the exception.
+
+To decide whether a different service is actually better, index each into its
+own `RAG_COLLECTION` and use [the eval harness](#knowing-whether-a-change-helped)
+— that turns "it feels sharper" into a number.
+
+### Embedding on the GPU
+
+`RAG_EMBED_GPU=1` runs the embedding model on CUDA. It speeds up a first index
+over a large corpus and does almost nothing for query latency, where embedding
+one short question is about two per cent of the work.
+
+It needs `onnxruntime-gpu`, which **replaces** `onnxruntime` rather than sitting
+beside it — they share an install directory, so having both silently shadows
+the GPU build and uninstalling either breaks the other. Install it deliberately,
+after the normal requirements:
+
+```powershell
+pip uninstall -y onnxruntime
+pip install --force-reinstall onnxruntime-gpu
+```
+
+Match the build to the machine's CUDA: the default PyPI wheel wants CUDA 13,
+while CUDA 12 hosts need the separate index documented in `.env.example`.
+
+**Check it actually took.** When the driver libraries are missing, onnxruntime
+logs a warning and runs on the CPU rather than failing — which means a benchmark
+can report a speedup that is CPU both times. `GET /health` reports
+`embed_provider`, which is what onnxruntime chose rather than what was asked
+for; it should say `CUDAExecutionProvider` before you believe any number.
 
 Changing the model changes the vector width, so follow it with
 `.\rag-up.ps1 reindex -Full` — and it will tell you if you forget, since the
@@ -1059,6 +1123,71 @@ Three things worth knowing about what the number means:
 
 Today's date is included in the facts given to the model, because "this year"
 is unanswerable without a clock and a model has none.
+
+## Deciding one thing about every row of a spreadsheet
+
+A different shape of question again: sixteen thousand failure modes, one
+document defining what makes a failure mode built-in-test applicable, and a
+verdict needed for each row. Done a row at a time through retrieve-and-ask it
+cost about 1.5 seconds a row — roughly six and three quarter hours, before
+anyone disagrees with a verdict and wants it re-run.
+
+Almost none of that time was doing anything useful, and where it went decides
+what to fix. **Embedding a row costs 27 ms and searching for it a few more —
+under two per cent.** The rest is a model writing one verdict. So a faster
+embedder, or a GPU under it, buys nothing here. Three things do:
+
+- **The criteria never change.** Every row retrieved substantially the same
+  passages. Retrieved once and reused, that work disappears — and every row is
+  judged against identical wording, which matters more for a determination
+  someone has to defend than the speed does.
+- **Rows repeat.** The same failure mode recurs across many line items with
+  different identifiers. Decided once per distinct case and mapped back, the
+  model sees a fraction of the sheet.
+- **A verdict is small.** One call carries many rows, so the fixed cost of a
+  call is paid per batch rather than per row.
+
+```powershell
+$body = @{
+  path          = 'FMEA.xlsx'
+  columns       = @('Failure Mode', 'Local Effect')
+  criteria_query= 'when is a failure mode built-in test BIT applicable'
+  labels        = @('applicable', 'not applicable')
+  id_column     = 'FM_ID'
+  batch_size    = 50
+  concurrency   = 4
+} | ConvertTo-Json
+Invoke-RestMethod -Uri http://127.0.0.1:49404/classify -Method POST -Body $body -ContentType "application/json"
+# rows: 16000, distinct_cases: 168, repeats_collapsed: 15832
+```
+
+`GET /classify` reports progress and a rate; `POST /classify/cancel` stops after
+the batch in flight and keeps what was decided; `GET /classify/csv` downloads
+the verdicts with the columns that identify each row. One job runs at a time,
+on a worker thread, so search stays answerable throughout.
+
+Every verdict carries **which criterion decided it**, because "applicable"
+alone is an opinion and "applicable, by the continuous-monitoring clause" is a
+determination.
+
+**Batch size is an accuracy dial that happens to also make things faster.**
+Past some width a model starts pattern-matching across rows instead of judging
+each on its merits, and where that begins depends on the model and the rows.
+Point `truth_column` at a column of known-correct answers and the reply carries
+an agreement rate — run 1, 10, 25, 50 and watch where it falls off. That is how
+"we ran it at 50" becomes an auditable choice rather than a guess.
+
+**Nothing is dropped silently.** A batch whose reply cannot be parsed, or comes
+back missing rows, is retried in halves and finally one row at a time; a row
+that fails alone is recorded with its reason. Sixteen thousand determinations
+with four unexplained gaps is a worse outcome than one that took longer.
+
+Two practical notes. **Use an HTTP backend, not a CLI one** — `claude` and
+`codex` spawn a process per call, five to seven seconds that is invisible in
+chat and an hour of pure overhead across several hundred batches. And
+`concurrency` only pays against a model server that genuinely runs requests in
+parallel; past that, requests queue and the only thing that grows is how long
+each appears to take.
 
 ## When your words and the document's words differ
 
