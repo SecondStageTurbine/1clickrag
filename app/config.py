@@ -366,13 +366,23 @@ class Config:
     # yet. A real situation and a bad default, hence opt-out rather than opt-in.
     embed_verify_tls: bool = _env_bool("RAG_EMBED_VERIFY_TLS", True)
 
-    # Run the embedding model on the GPU. Needs onnxruntime-gpu, which REPLACES
-    # the CPU onnxruntime rather than sitting beside it - so this is off by
-    # default and falls back to CPU with a warning when no CUDA provider is
-    # present, rather than refusing to start. It speeds up a first index over a
-    # large corpus; it does almost nothing for query latency, where embedding
-    # one short question is a couple of per cent of the work.
-    embed_gpu: bool = _env_bool("RAG_EMBED_GPU", False)
+    # Run the ONNX models - the embedder and the cross-encoder reranker - on the
+    # GPU. Needs onnxruntime-gpu, which REPLACES the CPU onnxruntime rather than
+    # sitting beside it, so this is off by default and falls back to CPU with a
+    # warning when no CUDA provider is present rather than refusing to start.
+    #
+    # This governed only the embedder until v1.10.0, under the name
+    # RAG_EMBED_GPU, and the note here used to say it did almost nothing for
+    # query latency. That was true and misleading in equal measure. Embedding a
+    # question is 33ms; it is not what a search spends its time on. Reranking
+    # is, at 4.5s for 150 candidates on CPU, and it was the one neural model
+    # that never got a provider - so measuring "GPU makes queries no faster"
+    # measured a wiring gap and read like a fact about hardware. One flag now,
+    # because "use my GPU" was never a statement about which model.
+    #
+    # The old name is still honoured: a machine that set RAG_EMBED_GPU=1 asked
+    # for the GPU and should get all of it.
+    gpu: bool = _env_bool("RAG_GPU", _env_bool("RAG_EMBED_GPU", False))
 
     embed_batch: int = _env_int("RAG_EMBED_BATCH", 32)
     # ONNX inference threads. Defaults to this machine's core count rather than

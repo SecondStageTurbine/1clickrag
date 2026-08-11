@@ -19,6 +19,8 @@ import logging
 import os
 import time
 
+from . import accel
+
 log = logging.getLogger("rag.embedder")
 
 
@@ -32,14 +34,15 @@ class FastEmbedEmbedder:
     backend = "fastembed"
 
     def __init__(self, model: str, cache_dir: str, threads: int = 0,
-                 gpu: bool = False) -> None:
+                 gpu: bool = False, gpu_setting: str = "RAG_GPU") -> None:
         self.model_name = model
         self.cache_dir = cache_dir
         self.threads = threads
         self.gpu = gpu
+        self.gpu_setting = gpu_setting
         self._model = None
         self._dim: int | None = None
-        self._provider = "CPUExecutionProvider"
+        self._provider = accel.CPU
 
     def _load(self):
         if self._model is None:
@@ -60,49 +63,13 @@ class FastEmbedEmbedder:
             if self.threads > 0:
                 kwargs["threads"] = self.threads
             if self.gpu:
-                kwargs["providers"] = self._gpu_providers()
+                kwargs["providers"] = accel.providers(self.gpu_setting)
             self._model = TextEmbedding(**kwargs)
-            self._provider = self._active_provider()
+            self._provider = accel.active(self._model, self.gpu)
             log.info(
                 "embedding model %s ready on %s", self.model_name, self._provider
             )
         return self._model
-
-    def _gpu_providers(self) -> list[str]:
-        """CUDA first, CPU behind it - never CUDA alone.
-
-        onnxruntime falls through the list in order, so keeping CPU at the end
-        means a machine without a working CUDA build gets a slower ingest
-        instead of a server that will not start. Asking for GPU is a preference
-        about speed; it should not become a hard dependency on a driver.
-        """
-        try:
-            import onnxruntime as ort
-
-            available = ort.get_available_providers()
-        except ImportError:  # pragma: no cover - fastembed brings onnxruntime
-            return ["CPUExecutionProvider"]
-
-        if "CUDAExecutionProvider" not in available:
-            log.warning(
-                "RAG_EMBED_GPU is set but this onnxruntime has no CUDA provider "
-                "(it offers %s). Install onnxruntime-gpu, which REPLACES the CPU "
-                "build - falling back to CPU for now.",
-                ", ".join(available),
-            )
-            return ["CPUExecutionProvider"]
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-
-    def _active_provider(self) -> str:
-        """What onnxruntime actually chose, which is not always what was asked."""
-        session = getattr(self._model, "model", None)
-        for attribute in ("model", "session", "_session"):
-            session = getattr(session, attribute, session)
-            providers = getattr(session, "get_providers", None)
-            if callable(providers):
-                chosen = providers()
-                return chosen[0] if chosen else "unknown"
-        return "CUDAExecutionProvider" if self.gpu else "CPUExecutionProvider"
 
     @property
     def provider(self) -> str:
@@ -427,7 +394,7 @@ def make_embedder(cfg):
     if cfg.embed_backend == "fastembed":
         return FastEmbedEmbedder(
             cfg.embed_model, cfg.model_cache, getattr(cfg, "embed_threads", 0),
-            gpu=getattr(cfg, "embed_gpu", False),
+            gpu=accel.gpu_wanted(cfg), gpu_setting=accel.gpu_setting_name(),
         )
     raise EmbeddingError(
         f"unknown RAG_EMBED_BACKEND={cfg.embed_backend!r} "

@@ -28,6 +28,7 @@ from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import accel
 from . import classify as classify_module
 from . import corpus as corpus_module
 from . import settings as settings_module
@@ -61,7 +62,12 @@ SERVICE_ID = "rag-local"
 embedder = make_embedder(CONFIG)
 store = Store(CONFIG.qdrant_url, CONFIG.collection, CONFIG.qdrant_path)
 reranker = (
-    Reranker(CONFIG.rerank_model, CONFIG.model_cache, CONFIG.embed_threads)
+    Reranker(
+        CONFIG.rerank_model, CONFIG.model_cache, CONFIG.embed_threads,
+        # The reranker is the expensive model in the query path, so this is the
+        # half of RAG_GPU that a user actually feels.
+        gpu=accel.gpu_wanted(CONFIG), gpu_setting=accel.gpu_setting_name(),
+    )
     if CONFIG.rerank
     else None
 )
@@ -379,6 +385,11 @@ def health():
         "embed_provider": getattr(embedder, "provider", None),
         "rerank": bool(reranker),
         "rerank_model": CONFIG.rerank_model if reranker else None,
+        # Reported for the same reason as embed_provider, and mattering more:
+        # this is where a query's time goes, so a silent fall back to CPU here
+        # is the difference between a fast search and a five-second one.
+        "rerank_provider": getattr(reranker, "provider", None) if reranker else None,
+        "rerank_candidates": CONFIG.rerank_candidates if reranker else None,
         "qdrant": qdrant_ok,
         "vector_store": "embedded" if store.embedded else "server",
         "graph": bool(graph and graph.has_data()),

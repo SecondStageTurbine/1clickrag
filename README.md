@@ -692,11 +692,33 @@ To decide whether a different service is actually better, index each into its
 own `RAG_COLLECTION` and use [the eval harness](#knowing-whether-a-change-helped)
 — that turns "it feels sharper" into a number.
 
-### Embedding on the GPU
+### Running the models on the GPU
 
-`RAG_EMBED_GPU=1` runs the embedding model on CUDA. It speeds up a first index
-over a large corpus and does almost nothing for query latency, where embedding
-one short question is about two per cent of the work.
+`RAG_GPU=1` runs both ONNX models on CUDA — the embedder and the cross-encoder
+reranker.
+
+It speeds up a first index over a large corpus, which is the obvious win.
+What it does for *query* latency is less obvious, and worth spelling out
+because the intuitive answer is wrong:
+
+| | measured (CPU) |
+| --- | --- |
+| embed one short question | 33 ms |
+| rerank 10 candidates | 415 ms |
+| rerank 40 candidates (the default) | 1.3 s |
+| rerank 150 candidates | 4.5 s |
+
+Embedding the question is a rounding error — it is one short forward pass.
+Reranking is one forward pass *per retrieved candidate*, over passages of
+`RAG_CHUNK_CHARS` each, repeated for every re-search round. So with reranking
+off a search is milliseconds and the GPU changes nothing you can feel; with it
+on, the reranker is essentially the entire cost.
+
+> Until v1.10.0 this setting was `RAG_EMBED_GPU` and reached only the embedder.
+> Turning it on therefore did nothing measurable for query latency, and the
+> docs here said so — which read like a fact about GPUs when it was a missing
+> argument. `RAG_EMBED_GPU` is still honoured; it meant "use my GPU" and now
+> gets all of it.
 
 It needs `onnxruntime-gpu`, which **replaces** `onnxruntime` rather than sitting
 beside it — they share an install directory, so having both silently shadows
@@ -723,14 +745,22 @@ python -m app.gpucheck
 
 That asks for evidence a CPU run cannot fabricate: which provider the *loaded
 session* chose, whether GPU memory actually moved, whether it is faster once
-warmed up, and whether the vectors still match the CPU's — a silently different
-embedding would poison an index in a way nothing would report. It also runs a
+warmed up, and whether the output still matches the CPU's — a silently
+different embedding would poison an index, and a reranker that scores subtly
+differently would reorder results, in ways nothing would report. It also runs a
 negative control with CPU forced and must see CPU, because a check that cannot
 fail proves nothing. Exit code is non-zero until every part passes, and the
 failure says which one did not.
 
-`GET /health` reports `embed_provider` for the same reason, as a standing
-reminder of what onnxruntime chose rather than what was requested.
+It checks **both** models and reports them separately (`--what rerank` for just
+the cross-encoder). Read the reranker's verdict first: it is the one that
+decides how long a search takes, so a green light on the embedder alone is a
+green light on the wrong lamp — which is precisely how the reranker went six
+releases with no provider wiring at all.
+
+`GET /health` reports `embed_provider` and `rerank_provider` for the same
+reason, as a standing reminder of what onnxruntime chose rather than what was
+requested.
 
 Changing the model changes the vector width, so follow it with
 `.\rag-up.ps1 reindex -Full` — and it will tell you if you forget, since the
