@@ -34,15 +34,18 @@ class FastEmbedEmbedder:
     backend = "fastembed"
 
     def __init__(self, model: str, cache_dir: str, threads: int = 0,
-                 gpu: bool = False, gpu_setting: str = "RAG_GPU") -> None:
+                 gpu: bool = False, gpu_setting: str = "RAG_GPU",
+                 device: int = 0) -> None:
         self.model_name = model
         self.cache_dir = cache_dir
         self.threads = threads
         self.gpu = gpu
         self.gpu_setting = gpu_setting
+        self.device = device
         self._model = None
         self._dim: int | None = None
         self._provider = accel.CPU
+        self._device: int | None = None
 
     def _load(self):
         if self._model is None:
@@ -63,17 +66,23 @@ class FastEmbedEmbedder:
             if self.threads > 0:
                 kwargs["threads"] = self.threads
             # Always explicit, both ways - see accel.chosen().
-            kwargs["providers"] = accel.chosen(self.gpu, self.gpu_setting)
+            kwargs["providers"] = accel.chosen(self.gpu, self.gpu_setting, self.device)
             self._model = TextEmbedding(**kwargs)
             self._provider = accel.active(self._model, self.gpu)
+            self._device = accel.active_device(self._model)
             log.info(
-                "embedding model %s ready on %s", self.model_name, self._provider
+                "embedding model %s ready on %s%s", self.model_name, self._provider,
+                "" if self._device is None else f" (device {self._device})",
             )
         return self._model
 
     @property
     def provider(self) -> str:
         return self._provider
+
+    @property
+    def device_in_use(self) -> int | None:
+        return self._device
 
     # An in-process model has no liveness question once it is loaded.
     def alive(self) -> bool:
@@ -395,6 +404,7 @@ def make_embedder(cfg):
         return FastEmbedEmbedder(
             cfg.embed_model, cfg.model_cache, getattr(cfg, "embed_threads", 0),
             gpu=accel.gpu_wanted(cfg), gpu_setting=accel.gpu_setting_name(),
+            device=getattr(cfg, "gpu_device", 0),
         )
     raise EmbeddingError(
         f"unknown RAG_EMBED_BACKEND={cfg.embed_backend!r} "

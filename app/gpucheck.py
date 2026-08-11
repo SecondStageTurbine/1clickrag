@@ -243,8 +243,9 @@ def check_rerank(args, cache_dir: str, say) -> tuple[dict, list[str]]:
         return report, [report["verdict"]]
     report["checks"]["negative_control"] = True
 
-    say("\n  2. CUDA requested")
-    gpu = run_rerank_once(["CUDAExecutionProvider", "CPUExecutionProvider"],
+    say(f"\n  2. CUDA requested (device {args.device})")
+    gpu = run_rerank_once([("CUDAExecutionProvider", {"device_id": args.device}),
+                           "CPUExecutionProvider"],
                           model_name, cache_dir, candidates)
     say(f"     session provider ......... {gpu['provider']}")
     say(f"     gpu memory moved ......... {gpu['gpu_memory_delta_mib']} MiB")
@@ -283,6 +284,9 @@ def check_rerank(args, cache_dir: str, say) -> tuple[dict, list[str]]:
             f"the reranker session fell back to {gpu['provider']} - this is the "
             f"model that dominates query latency, so this is the fall back that "
             f"costs the most"
+            + (f", and device {args.device} does not exist on this host "
+               f"({len(gpu_names())} GPU(s) found), which is enough on its own"
+               if args.device >= max(len(gpu_names()), 1) else "")
         )
     if on_gpu and not moved:
         problems.append(
@@ -313,6 +317,8 @@ def main() -> int:
                         help="passages to rerank (default: RAG_RERANK_CANDIDATES)")
     parser.add_argument("--what", choices=("embed", "rerank", "both"), default="both",
                         help="which model to prove (default: both)")
+    parser.add_argument("--device", type=int, default=None,
+                        help="CUDA device to probe (default: RAG_GPU_DEVICE)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -320,9 +326,12 @@ def main() -> int:
         from .config import CONFIG
         model_name = args.model or CONFIG.embed_model
         cache_dir = args.cache or CONFIG.model_cache
+        device = args.device if args.device is not None else CONFIG.gpu_device
     except Exception:
         model_name = args.model or "nomic-ai/nomic-embed-text-v1.5"
         cache_dir = args.cache or ".data/models"
+        device = args.device or 0
+    args.device = device
 
     report: dict = {"model": model_name, "checks": {}}
     say = (lambda *a: None) if args.json else print
@@ -403,8 +412,9 @@ def main() -> int:
         return 1
 
     # 3 - the real thing
-    say("\n  3. CUDA requested")
-    gpu = run_once(["CUDAExecutionProvider", "CPUExecutionProvider"],
+    say(f"\n  3. CUDA requested (device {args.device})")
+    gpu = run_once([("CUDAExecutionProvider", {"device_id": args.device}),
+                    "CPUExecutionProvider"],
                    model_name, cache_dir, args.batch_size)
     say(f"     session provider ......... {gpu['provider']}")
     say(f"     gpu memory moved ......... {gpu['gpu_memory_delta_mib']} MiB")

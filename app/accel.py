@@ -80,7 +80,7 @@ def preload() -> bool:
     return True
 
 
-def providers(setting: str = "RAG_GPU") -> list[str]:
+def providers(setting: str = "RAG_GPU", device: int = 0) -> list:
     """CUDA first, CPU behind it - never CUDA alone.
 
     onnxruntime walks the list in order, so keeping CPU at the end means a
@@ -112,10 +112,14 @@ def providers(setting: str = "RAG_GPU") -> list[str]:
             ", ".join(available),
         )
         return [CPU]
-    return [CUDA, CPU]
+    # The tuple form, always, because the plain string means device 0 and says
+    # nothing about it. On a single-GPU box that is the same thing; on a shared
+    # multi-GPU host it is the difference between using the card you were given
+    # and taking the one someone else is training on.
+    return [(CUDA, {"device_id": int(device)}), CPU]
 
 
-def chosen(gpu: bool, setting: str = SETTING) -> list[str]:
+def chosen(gpu: bool, setting: str = SETTING, device: int = 0) -> list:
     """The provider list to build a session with, for either answer.
 
     The `gpu=False` half is not "pass nothing and let onnxruntime decide",
@@ -129,7 +133,46 @@ def chosen(gpu: bool, setting: str = SETTING) -> list[str]:
     take about 2.7 GB between them - which is VRAM the generator does not get,
     silently, on the strength of a setting the user believed was off.
     """
-    return providers(setting) if gpu else [CPU]
+    return providers(setting, device) if gpu else [CPU]
+
+
+def active_device(model) -> int | None:
+    """Which CUDA device the loaded session bound to, or None if it is on CPU.
+
+    Asked of the session for the same reason as the provider: requesting device
+    1 on a box that has one card does not fail, it falls back to CPU - so the
+    request is not evidence, and on a shared host "which card am I on" is the
+    question being asked.
+    """
+    session = _session_of(model)
+    if session is None:
+        return None
+    try:
+        options = session.get_provider_options().get(CUDA)
+    except Exception:  # pragma: no cover - a session that cannot answer
+        return None
+    if not options or "device_id" not in options:
+        return None
+    try:
+        return int(options["device_id"])
+    except (TypeError, ValueError):  # pragma: no cover
+        return None
+
+
+def _session_of(model):
+    """The onnxruntime session inside a fastembed wrapper, or None."""
+    seen = set()
+    queue = [model]
+    while queue:
+        obj = queue.pop(0)
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if callable(getattr(obj, "get_providers", None)):
+            return obj
+        for attribute in ("model", "session", "_session", "embedding_model"):
+            queue.append(getattr(obj, attribute, None))
+    return None
 
 
 def active(model, requested_gpu: bool = False) -> str:
@@ -143,21 +186,12 @@ def active(model, requested_gpu: bool = False) -> str:
     Falls back to the request only when no session can be found, which is the
     one case where an honest answer is unavailable.
     """
-    seen = set()
-    queue = [model]
-    while queue:
-        obj = queue.pop(0)
-        if obj is None or id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        getter = getattr(obj, "get_providers", None)
-        if callable(getter):
-            try:
-                chosen = getter()
-            except Exception:  # pragma: no cover - a session that cannot answer
-                continue
-            if chosen:
-                return chosen[0]
-        for attribute in ("model", "session", "_session", "embedding_model"):
-            queue.append(getattr(obj, attribute, None))
+    session = _session_of(model)
+    if session is not None:
+        try:
+            names = session.get_providers()
+        except Exception:  # pragma: no cover - a session that cannot answer
+            names = None
+        if names:
+            return names[0]
     return CUDA if requested_gpu else CPU

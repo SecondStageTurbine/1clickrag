@@ -11,6 +11,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import re
 from typing import Iterator
 
 from .config import FILENAME_LANGUAGES, LANGUAGE_BY_EXT, Config
@@ -164,12 +165,45 @@ def read_text(abs_path: str, max_bytes: int) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def scrub(text: str | None) -> str | None:
+    """Replace lone surrogates with U+FFFD.
+
+    A str in Python may hold surrogate code points that no UTF-8 encoder will
+    accept, and document extractors produce them: a PDF with a malformed
+    ToUnicode map hands back half a surrogate pair, which is not a character
+    and never was. Everything downstream eventually encodes - the extraction
+    cache compresses UTF-8, the tokeniser wants UTF-8, SQLite wants UTF-8 - so
+    one such code point anywhere in a 16,000-page corpus aborted the ingest
+    with `'utf-8' codec can't encode character '\\ud800'`, naming a codec
+    rather than the file, from a stack that had nothing to do with the PDF.
+
+    U+FFFD rather than deletion, for consistency: every other decode here uses
+    errors="replace" and therefore already yields U+FFFD for bytes it cannot
+    make sense of. Same signal, same character, one meaning - "something was
+    here and could not be represented".
+    """
+    if text is None or not _SURROGATES.search(text):
+        return text
+    return _SURROGATES.sub("�", text)
+
+
 def load_text(abs_path: str, max_bytes: int) -> str | None:
     """Text of any indexable file, extracting document formats as needed.
 
     Accepts an archive member's virtual path ("bundle.zip!doc.pdf") as well as
     an ordinary file.
+
+    Every path out of here is scrubbed of lone surrogates, because this is the
+    one funnel all indexable text passes through - guarding the individual
+    extractors would mean guarding each new one forever.
     """
+    return scrub(_load_text(abs_path, max_bytes))
+
+
+def _load_text(abs_path: str, max_bytes: int) -> str | None:
     # Imported lazily: these reach for optional third-party libraries, and
     # selftest.py must be able to walk a corpus with none of them present.
     from .archive import read_member, split_member
