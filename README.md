@@ -237,6 +237,16 @@ filters, a keyword toggle, a hops selector with a when-to-use guide, live index
 status, and a re-index button. Results show which arms found them. A second tab
 holds a [chat pane](#chat-in-the-browser), if a generator is configured.
 
+A third tab lists **every setting and its value right now** — filterable, with
+"only what I have changed" for the short version. The configuration surface is
+past what anyone will read a file to discover, and someone wondering why search
+feels wrong should be able to see that reranking is off without opening
+`rag\.env` and remembering which of eighty-odd variables governs it. Each row
+says whether the value came from `rag\.env` or is built in, and whether changing
+it needs a reindex. It is read-only, and API keys are shown as set or not set —
+never printed, because a browser tab gets screen-shared. Same data on
+`GET /settings`.
+
 **Shell**
 
 ```powershell
@@ -269,6 +279,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/` | GET | Browser search UI |
 | `/health` | GET | `status`, `embeddings`, `qdrant`, `chunks`, `model` |
 | `/stats` | GET | Index size, repo, backend, last ingest, uptime |
+| `/settings` | GET | Every setting, its value now, and where it came from |
 | `/search` | POST | Ranked hits, snippet-truncated |
 | `/search/full` | POST | Ranked hits, full chunk text |
 | `/context` | POST | The same hits, assembled into a citable block for a generator |

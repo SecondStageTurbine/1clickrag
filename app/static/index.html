@@ -170,6 +170,26 @@
   .cite:hover { border-color: var(--accent); }
   .caret { display: inline-block; width: 7px; height: 7px; background: var(--muted); border-radius: 50%; animation: blink 1s steps(2) infinite; vertical-align: baseline; }
   .thinking { color: var(--muted); font-style: italic; }
+  .sgroup { margin-bottom: 22px; }
+  .sgroup > h3 {
+    margin: 0 0 8px; font-size: 12px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  .srow {
+    display: grid; grid-template-columns: minmax(190px, 1fr) minmax(120px, 0.8fr) 2fr;
+    gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); align-items: baseline;
+  }
+  @media (max-width: 760px) { .srow { grid-template-columns: 1fr; gap: 3px; } }
+  .srow .name { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .srow .val { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .srow .why { color: var(--muted); font-size: 12.5px; }
+  /* A changed setting is the one worth finding on this page, so it is the only
+     thing given colour. */
+  .srow.changed .name { color: var(--accent); font-weight: 600; }
+  .srow.changed .val { color: var(--text); font-weight: 600; }
+  .srow .val .def { color: var(--muted); font-weight: 400; }
+  .srow .effect { display: block; margin-top: 3px; color: #d29922; font-size: 11.5px; }
+  .srow .secret { color: var(--muted); font-style: italic; }
   .counts {
     margin-top: 10px; padding: 9px 12px; font-size: 12.5px; color: var(--muted);
     background: var(--code-bg); border: 1px solid var(--border); border-radius: 9px;
@@ -195,6 +215,7 @@
     <div class="tabs" role="tablist">
       <button type="button" id="tab-search" role="tab" aria-selected="true">Search</button>
       <button type="button" id="tab-chat" role="tab" aria-selected="false" hidden>Chat</button>
+      <button type="button" id="tab-settings" role="tab" aria-selected="false">Settings</button>
     </div>
     <div id="status"><span class="dot"></span><span id="status-text">checking…</span></div>
     <div style="flex:1"></div>
@@ -271,6 +292,22 @@
     </p>
     <div id="meta" class="meta" hidden></div>
     <div id="results"></div>
+  </section>
+
+  <section id="pane-settings" hidden>
+    <div class="filters">
+      <input id="setting-filter" placeholder="filter settings — try ocr, chat, embed" style="flex:1 1 300px">
+      <label class="toggle" title="Only the ones set in rag\.env or the environment.">
+        <input type="checkbox" id="only-changed"> only what I have changed
+      </label>
+    </div>
+    <p class="hint">
+      Every setting, its value right now, and whether that came from
+      <code>rag\.env</code> or the built-in default. Read-only — edit
+      <code>rag\.env</code> and restart to change one. API keys are shown as set
+      or not set, never printed.
+    </p>
+    <div id="settings-body"></div>
   </section>
 
   <section id="pane-chat" hidden>
@@ -482,14 +519,82 @@ let history = [];
 let busy = false;
 
 function showTab(which) {
-  $('pane-search').hidden = which !== 'search';
-  $('pane-chat').hidden = which !== 'chat';
-  $('tab-search').setAttribute('aria-selected', String(which === 'search'));
-  $('tab-chat').setAttribute('aria-selected', String(which === 'chat'));
-  ($(which === 'chat' ? 'msg' : 'q')).focus();
+  for (const name of ['search', 'chat', 'settings']) {
+    $('pane-' + name).hidden = which !== name;
+    $('tab-' + name).setAttribute('aria-selected', String(which === name));
+  }
+  // The shared filters belong to the two search-backed panes, not to settings,
+  // which has a filter of its own.
+  document.querySelector('#pane-search').previousElementSibling.hidden = which === 'settings';
+  if (which === 'search') $('q').focus();
+  if (which === 'chat') $('msg').focus();
+  if (which === 'settings') { $('setting-filter').focus(); loadSettings(); }
 }
 $('tab-search').addEventListener('click', () => showTab('search'));
 $('tab-chat').addEventListener('click', () => showTab('chat'));
+$('tab-settings').addEventListener('click', () => showTab('settings'));
+
+let settingsData = null;
+
+async function loadSettings() {
+  if (settingsData) return renderSettings();
+  $('settings-body').innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    settingsData = await (await fetch('/settings')).json();
+  } catch (e) {
+    $('settings-body').innerHTML = `<div class="empty">${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  renderSettings();
+}
+
+function renderSettings() {
+  if (!settingsData) return;
+  const needle = $('setting-filter').value.trim().toLowerCase();
+  const onlyChanged = $('only-changed').checked;
+  const groups = [];
+  let shown = 0;
+
+  for (const section of settingsData.sections) {
+    const rows = section.settings.filter((s) => {
+      if (onlyChanged && !s.set_explicitly) return false;
+      if (!needle) return true;
+      return (s.setting + ' ' + s.description + ' ' + section.name)
+        .toLowerCase().includes(needle);
+    });
+    if (!rows.length) continue;
+    shown += rows.length;
+    groups.push(`<div class="sgroup"><h3>${escapeHtml(section.name)}</h3>` +
+      rows.map((s) => {
+        const value = s.secret
+          ? `<span class="secret">${escapeHtml(String(s.value))}</span>`
+          : escapeHtml(JSON.stringify(s.value));
+        // Where the value came from, which is the reliable and useful fact.
+        // See app/settings.py for why there is no "default" here.
+        const def = s.derived
+          ? '<br><span class="def">worked out at startup</span>'
+          : (s.set_explicitly
+             ? '<br><span class="def">from rag\\.env</span>'
+             : '<br><span class="def">built-in</span>');
+        const effect = s.changing_it
+          ? `<span class="effect">${escapeHtml(s.changing_it)}</span>` : '';
+        return `<div class="srow${s.set_explicitly ? ' changed' : ''}">
+          <div class="name">${escapeHtml(s.setting)}</div>
+          <div class="val">${value}${def}</div>
+          <div class="why">${escapeHtml(s.description || '')}${effect}</div>
+        </div>`;
+      }).join('') + '</div>');
+  }
+
+  $('settings-body').innerHTML =
+    `<div class="meta">${settingsData.count} settings · ` +
+    `${settingsData.changed} set in <code>rag\\.env</code> or the environment` +
+    (needle || onlyChanged ? ` · showing ${shown}` : '') + `</div>` +
+    (groups.join('') || '<div class="empty">Nothing matches.</div>');
+}
+
+$('setting-filter').addEventListener('input', renderSettings);
+$('only-changed').addEventListener('change', renderSettings);
 
 // The generators available right now, keyed by id, so the banner can describe
 // whichever one is selected without asking the server again.

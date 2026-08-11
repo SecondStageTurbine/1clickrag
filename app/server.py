@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from . import classify as classify_module
 from . import corpus as corpus_module
+from . import settings as settings_module
 from . import sheet as sheet_module
 from . import expand as expand_module
 from . import manifest as manifest_module
@@ -405,6 +406,20 @@ def health():
     if embedder.backend == "ollama":
         payload["ollama"] = embed_ok
     return payload
+
+
+@app.get("/settings")
+def settings():
+    """Every setting, its value now, and where that value came from.
+
+    Read-only on purpose. Writing .env and restarting from inside a request is
+    a lot of machinery for something a text editor does, and it would let one
+    stray request take the index offline.
+
+    Secrets are reported as present or absent and never echoed - this is a
+    browser tab, and browser tabs get screen-shared.
+    """
+    return settings_module.snapshot(CONFIG)
 
 
 @app.get("/stats")
