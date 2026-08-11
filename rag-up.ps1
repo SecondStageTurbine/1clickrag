@@ -725,26 +725,23 @@ function New-Package {
     # and any caller checking the status treating it as a failure.
     $global:LASTEXITCODE = 0
 
-    # Clear the packaged .env of everything that is a decision about THIS
-    # machine, keeping the tuning that travels (port, threads, embedding model,
-    # exclusions).
+    # No .env in the package at all.
     #
-    # The corpus, because the target points at a path that does not exist there
-    # and - worse - the first-run folder picker never appears, since a corpus
-    # looks configured. RAG_CHAT_API_KEY, because this zip gets copied between
-    # machines and published as a release asset, and a key that has been in one
-    # is compromised. And everything the setup questions own - OCR, reranking,
-    # the chat provider - because inheriting them is silently wrong: a target
-    # installed with -Folder never sees those questions, so it would arrive with
-    # OCR on and a chat pane pointed at an Ollama on somebody else's localhost.
-    # Off is the documented default; let the target choose for itself.
+    # Earlier versions shipped one with the machine-specific lines stripped out,
+    # which was the wrong shape twice over. It gains a new install nothing -
+    # rag-up writes .env itself when the folder is chosen, and .env.example is
+    # the documentation - while giving an *upgrade* a way to destroy the target's
+    # configuration: unzip over an existing install and its corpus path, chat
+    # settings and OCR choice are replaced by a near-empty file from somebody
+    # else's machine. "Unzip it over the old one" is the obvious way to upgrade
+    # and it should not be a trap.
+    #
+    # .env.example still travels: it is the template, and the Settings tab reads
+    # it for the description of every setting.
     $stagedEnv = Join-Path $stage '.env'
     if (Test-Path $stagedEnv) {
-        $kept = Get-Content $stagedEnv |
-            Where-Object { $_ -notmatch '^\s*RAG_(REPO_MOUNT|REPO_LABEL|CHAT_[A-Z_]+|OCR|RERANK)\s*=' }
-        if ($kept) { Set-Content -Path $stagedEnv -Value $kept -Encoding ascii }
-        else { Remove-Item $stagedEnv -Force }
-        Write-Host '    (cleared the corpus, any API key, and the per-machine choices)'
+        Remove-Item $stagedEnv -Force
+        Write-Host '    (no .env packaged - the target keeps or creates its own)'
     }
 
     Write-Host '==> compressing' -ForegroundColor Cyan

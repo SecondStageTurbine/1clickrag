@@ -235,6 +235,21 @@ and are reused.
 
 ## Using it
 
+**Upgrading an existing install** — unzip a newer release over the old folder,
+then delete `.venv` so it rebuilds against the bundled wheels:
+
+```powershell
+.\rag-up.ps1 down            # release the index lock
+# unzip over the top, replacing files
+Remove-Item .venv -Recurse -Force
+.\rag-up.ps1
+```
+
+Your `.env` survives, because the package deliberately contains none — and so
+does your index, which is excluded from the zip along with the keyword index,
+the extraction cache and the queue. Check the Settings tab afterwards to see
+what the running configuration actually is.
+
 **Browser** — <http://127.0.0.1:49404>. Query box, language and path-prefix
 filters, a keyword toggle, a hops selector with a when-to-use guide, live index
 status, and a re-index button. Results show which arms found them. A second tab
