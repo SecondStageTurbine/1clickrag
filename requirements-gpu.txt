@@ -1,0 +1,35 @@
+# Optional: run the ONNX models (embedder and cross-encoder reranker) on CUDA.
+#
+# NOT part of the normal install. onnxruntime-gpu REPLACES onnxruntime rather
+# than sitting beside it - the two share an install directory, so having both
+# silently shadows the GPU build and uninstalling either breaks the other.
+# Install this after the base requirements, never instead of them:
+#
+#     .\rag-up.ps1 gpu
+#
+# The [cuda,cudnn] extras are not optional. The bare wheel bundles neither CUDA
+# nor cuDNN, and without them onnxruntime offers CUDAExecutionProvider, accepts
+# it, then logs "Failed to create CUDAExecutionProvider. Require cuDNN 9.* and
+# CUDA 13.*" and runs on the CPU - which is indistinguishable from having no GPU
+# at all, and reports a 1.0x "speedup" that is CPU on both sides.
+#
+# These extras pull seven nvidia-* wheels, about 1.1 GB. All of them are tagged
+# py3-none-win_amd64, so one copy serves every Python version; only
+# onnxruntime-gpu itself is per-interpreter, at roughly 230 MB each.
+#
+# --- CUDA 13 hosts (the default PyPI wheels) --------------------------------
+onnxruntime-gpu[cuda,cudnn]>=1.28,<2
+
+# --- CUDA 12 hosts ----------------------------------------------------------
+# The default wheel above wants CUDA 13. Check the host first:
+#
+#     nvidia-smi        (the header reports "CUDA Version")
+#
+# For a CUDA 12 machine, comment out the line above and bundle with
+# -Cuda 12, which adds the separate index those wheels live in:
+#
+#     https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
+#
+# Building the wrong one is worth avoiding deliberately: it is a ~2 GB transfer
+# through whatever review a closed network puts in front of new packages, and
+# the failure only appears on the target, offline, as a silent fall back to CPU.

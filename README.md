@@ -731,9 +731,40 @@ the GPU build and uninstalling either breaks the other. Install it deliberately,
 after the normal requirements:
 
 ```powershell
+.\rag-up.ps1 gpu
+```
+
+That swaps `onnxruntime` for `onnxruntime-gpu`, runs the proof below, and only
+writes `RAG_GPU=1` if it passes. By hand it is:
+
+```powershell
 pip uninstall -y onnxruntime
 pip install --force-reinstall "onnxruntime-gpu[cuda,cudnn]"
 ```
+
+**With no internet on the target** — vendor the wheels before you travel, on a
+machine that does have it:
+
+```powershell
+.\rag-up.ps1 bundle -Gpu                      # add -Cuda 12 for a CUDA 12 host
+.\rag-up.ps1 package -Gpu                     # include them in the zip
+```
+
+Then `.\rag-up.ps1 gpu` over there installs from `vendor\wheels-gpu` with no
+network. Sizes, because they decide whether this is one zip or two:
+
+| | |
+| --- | --- |
+| the seven `nvidia-*` wheels (`py3-none-win_amd64`) | 1,080 MB, one copy serves every Python |
+| `onnxruntime-gpu` (per interpreter) | 230 MB each |
+| pack for Python 3.11–3.14 | **2,001 MB** |
+| pack for one known Python version | **1,310 MB** |
+
+Pinning the interpreter is the biggest lever available — worth doing when the
+target machine's Python is known, which for a managed fleet it usually is.
+Both `bundle -Gpu` and `package -Gpu` are opt-in: without the switch the CUDA
+wheels are neither fetched nor packaged, so a machine with no GPU still gets a
+371 MB wheel set rather than a 2.4 GB one.
 
 The `[cuda,cudnn]` extras matter. The bare wheel does not bundle CUDA or cuDNN,
 and without them onnxruntime offers `CUDAExecutionProvider`, accepts it, then

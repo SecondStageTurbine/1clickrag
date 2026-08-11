@@ -26,6 +26,8 @@
   .\rag-up.ps1 query "where is the IPC rendezvous done?"
   .\rag-up.ps1 ask "how is CHORD deployed?" -Project CHORD   # a prompt, ready for an LLM
   .\rag-up.ps1 bundle           # vendor wheels + model so it installs with no internet
+  .\rag-up.ps1 bundle -Gpu      # also vendor the CUDA wheels (~2 GB, needs internet once)
+  .\rag-up.ps1 gpu              # swap in onnxruntime-gpu and prove it took
   .\rag-up.ps1 package          # zip the whole thing up for the trip to another PC
   .\rag-up.ps1 logs             # tail the server log
   .\rag-up.ps1 down             # stop   (-Wipe also drops the index and model cache)
@@ -35,7 +37,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('up', 'setup', 'status', 'query', 'ask', 'reindex', 'autostart',
-                 'bundle', 'package', 'logs', 'down')]
+                 'bundle', 'gpu', 'package', 'logs', 'down')]
     [string]$Command = 'up',
 
     [Parameter(Position = 1)]
@@ -53,6 +55,15 @@ param(
     # Binary wheels are built per Python minor version; if the target machine
     # runs a different one than this machine, the offline install fails there.
     [string]$ForPython,
+
+    # `bundle` and `package`: include the CUDA wheels. Separate from the base
+    # set because they are about 2 GB against the base 371 MB, and a machine
+    # with no GPU should not download that to get a search box.
+    [switch]$Gpu,
+    # Which CUDA the target machine runs - `nvidia-smi` reports it in its
+    # header. 13 uses the default PyPI wheels; 12 needs a separate index.
+    [ValidateSet('12', '13')]
+    [string]$Cuda = '13',
 
     [switch]$Docker,
     [switch]$Full,
@@ -202,6 +213,31 @@ function Invoke-Setup {
         Write-Host '    off' -ForegroundColor DarkGray
     }
     Write-Host ''
+
+    # --- GPU ---------------------------------------------------------------
+    # Asked only when there is a card to use. The question is noise otherwise,
+    # and a "no" recorded on a machine with no GPU would be a decision about
+    # nothing.
+    $card = Get-NvidiaGpu
+    if ($card) {
+        Write-Host '  Run the models on the GPU' -ForegroundColor White
+        Write-Host "    Found: $card"
+        Write-Host '    Reranking is nearly all of what a search costs, and it is the'
+        Write-Host '    kind of work a GPU finishes about 20x sooner. Measured on one'
+        Write-Host '    card: a search went from 12.2s to 0.36s.'
+        if (Test-Path $GpuWheels) {
+            Write-Host '    The CUDA wheels are bundled here, so this needs no network.'
+        } else {
+            Write-Host '    Needs onnxruntime-gpu, which is a ~2 GB download and is NOT'
+            Write-Host '    bundled - so this needs internet, once.'
+        }
+        if (Read-YesNo '    Set it up now?' $true) {
+            Install-Gpu
+        } else {
+            Write-Host '    skipped - .\rag-up.ps1 gpu does it later' -ForegroundColor DarkGray
+        }
+        Write-Host ''
+    }
 
     # --- OCR --------------------------------------------------------------
     # Only worth asking when the corpus actually holds pages that might be
@@ -356,6 +392,13 @@ $Data = Join-Path $PSScriptRoot '.data'
 $Venv = Join-Path $PSScriptRoot '.venv'
 $VenvPy = Join-Path $Venv 'Scripts\python.exe'
 $Wheels = Join-Path $PSScriptRoot 'vendor\wheels'
+# Kept apart from the base wheels rather than mixed in. The base set installs
+# with `--find-links`, which would happily resolve onnxruntime-gpu over
+# onnxruntime for anyone who never asked for a GPU - and the two cannot coexist.
+# A separate directory also makes the GPU pack a thing you can ship or omit by
+# copying one folder.
+$GpuWheels = Join-Path $PSScriptRoot 'vendor\wheels-gpu'
+$CudaIndex = 'https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/'
 $PidFile = Join-Path $Data 'rag.pid'
 $LogFile = Join-Path $Data 'rag.log'
 
@@ -597,6 +640,162 @@ function Test-BundleResolves {
 # Prepare this folder to be carried to a machine with no internet access:
 # vendor the wheels and pre-download the model, so rag-up there needs neither
 # PyPI nor huggingface.co.
+function Get-NvidiaGpu {
+    <#
+      The first NVIDIA card's name, or $null.
+
+      nvidia-smi rather than WMI: the driver is what decides whether CUDA can
+      work at all, and a machine with a card but no driver should answer no.
+    #>
+    $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if (-not $smi) { return $null }
+    try {
+        $out = & nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
+    } catch {
+        return $null
+    }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $first = ($out | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+    if (-not $first) { return $null }
+    return $first.Trim()
+}
+
+function New-GpuBundle {
+    <#
+      Vendor the CUDA wheels so a machine with no internet can turn the GPU on.
+
+      Kept out of New-Bundle deliberately. This set is about 2 GB against the
+      base 371 MB, most of it two files - cuDNN and cuBLAS - and a machine
+      without a GPU gains nothing from carrying it.
+
+      The portable/per-interpreter split here is the same one New-Bundle
+      already handles: all seven nvidia-* wheels are py3-none-win_amd64, so one
+      copy serves every Python, and only onnxruntime-gpu is built per version
+      at ~230 MB each. Fetching for four Pythons therefore costs 690 MB extra,
+      not four times the total - which is why -ForPython is worth being precise
+      about when the target machine's version is known.
+    #>
+    Initialize-Venv
+    New-Item -ItemType Directory -Force -Path $GpuWheels | Out-Null
+
+    $here = & $VenvPy -c "import sys; print('%d.%d' % sys.version_info[:2])"
+    Write-Host "==> vendoring CUDA $Cuda wheels into $GpuWheels (for Python $here)" -ForegroundColor Cyan
+    Write-Host '    about 2 GB - cuDNN and cuBLAS are most of it'
+
+    $extra = @()
+    if ($Cuda -eq '12') { $extra = @('--extra-index-url', $CudaIndex) }
+
+    # download, not wheel: every distribution in this set publishes a binary
+    # wheel, so there is nothing to build, and --only-binary makes a missing
+    # one an error here rather than a build attempt on the target.
+    $base = @('download', '--only-binary=:all:', '-d', $GpuWheels) + $extra
+    $result = Invoke-Pip ($base + @('-r', 'requirements-gpu.txt'))
+    if (-not $result.Ok) {
+        Write-Host $result.Output
+        Write-Error 'could not fetch the CUDA wheels.'
+    }
+
+    # Only onnxruntime-gpu is interpreter-specific; the nvidia-* wheels are
+    # py3-none and already portable, so re-fetching the whole set per version
+    # would download a gigabyte to land seven duplicates.
+    $specific = Get-ChildItem $GpuWheels -Filter *.whl |
+        Where-Object { $_.Name -match '-cp\d+-cp\d+' } |
+        ForEach-Object {
+            $parts = $_.Name -split '-'
+            [pscustomobject]@{ Name = $parts[0]; Version = $parts[1] }
+        } | Sort-Object Name, Version -Unique
+
+    foreach ($version in ($ForPython -split ',' | Where-Object { $_ })) {
+        $version = $version.Trim()
+        Write-Host "==> also fetching CUDA wheels for Python $version" -ForegroundColor Cyan
+        $before = (Get-ChildItem $GpuWheels -Filter *.whl).Count
+        foreach ($dist in $specific) {
+            $common = @('download', '--quiet', '--only-binary=:all:', '--no-deps',
+                        '--python-version', $version, '--platform', 'win_amd64',
+                        '-d', $GpuWheels) + $extra
+            $r = Invoke-Pip ($common + @("$($dist.Name)==$($dist.Version)"))
+            if (-not $r.Ok) { $null = Invoke-Pip ($common + @($dist.Name)) }
+        }
+        Write-Host "    added $((Get-ChildItem $GpuWheels -Filter *.whl).Count - $before) wheel(s) for $version"
+    }
+
+    $size = (Get-ChildItem $GpuWheels -File | Measure-Object -Sum Length).Sum / 1GB
+    Write-Host ''
+    Write-Host ("    {0} wheel(s), {1:N2} GB" -f (Get-ChildItem $GpuWheels -Filter *.whl).Count, $size) -ForegroundColor Green
+    Write-Host '    Include them in the trip with:  .\rag-up.ps1 package -Gpu'
+    Write-Host '    Turn it on over there with:     .\rag-up.ps1 gpu'
+}
+
+function Install-Gpu {
+    <#
+      Swap onnxruntime for onnxruntime-gpu, then prove it took.
+
+      A separate command rather than part of `up` because it is a destructive
+      change to the environment - onnxruntime-gpu REPLACES onnxruntime, and a
+      machine that cannot reach a network afterwards cannot undo it without the
+      base wheels, which is exactly why they stay vendored.
+    #>
+    Initialize-Venv
+
+    $offline = (Test-Path $GpuWheels) -and (Get-ChildItem $GpuWheels -Filter *.whl -ErrorAction SilentlyContinue)
+    Write-Host '==> installing onnxruntime-gpu (this REPLACES onnxruntime)' -ForegroundColor Cyan
+
+    # Every pip call goes through Invoke-Pip: pip says ordinary things on
+    # stderr ("Skipping onnxruntime as it is not installed" on a re-run), and
+    # with $ErrorActionPreference = 'Stop' a native command's stderr is a
+    # terminating error - so a second `gpu` would abort on a warning.
+    $null = Invoke-Pip @('uninstall', '--quiet', '-y', 'onnxruntime')
+
+    if ($offline) {
+        Write-Host "    from $GpuWheels (offline)"
+        $result = Invoke-Pip @('install', '--quiet', '--no-index',
+                               '--find-links', $GpuWheels, '-r', 'requirements-gpu.txt')
+    } else {
+        Write-Host '    from PyPI - no vendored wheels found'
+        # Not $args - that is an automatic variable, and assigning to it inside
+        # a function shadows the caller's arguments.
+        $pipArgs = @('install', '--quiet', '-r', 'requirements-gpu.txt')
+        if ($Cuda -eq '12') { $pipArgs += @('--extra-index-url', $CudaIndex) }
+        $result = Invoke-Pip $pipArgs
+    }
+    if (-not $result.Ok) {
+        Write-Host $result.Output
+        Write-Host ''
+        Write-Host '    install failed. Put it back with:' -ForegroundColor Yellow
+        Write-Host '        .venv\Scripts\python.exe -m pip install --no-index --find-links vendor\wheels onnxruntime'
+        Write-Error 'CUDA install failed.'
+    }
+
+    # pip warns that fastembed and rapidocr-onnxruntime "require onnxruntime,
+    # which is not installed". They have it: onnxruntime-gpu provides the same
+    # module under a different distribution name, and neither pins a version.
+    Write-Host ''
+    Write-Host '==> proving it (a provider that is offered is not a provider that runs)' -ForegroundColor Cyan
+    # Same reason as above: onnxruntime logs its CUDA warnings to stderr, and
+    # the interesting run is precisely the one that warns.
+    # Not piped: routing a native command's output through the pipeline in
+    # PowerShell 5.1 re-decodes it, and onnxruntime's coloured stderr arrives
+    # as spaced-out UTF-16 mush. Straight to the console it stays readable.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $VenvPy -m app.gpucheck
+        $proved = ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if (-not $proved) {
+        Write-Host ''
+        Write-Host '    NOT PROVEN - see above. RAG_GPU is left alone.' -ForegroundColor Yellow
+        return
+    }
+
+    Set-EnvValue 'RAG_GPU' '1'
+    Write-Host ''
+    Write-Host '    proven, and RAG_GPU=1 written to rag\.env' -ForegroundColor Green
+    Write-Host '    restart to pick it up:  .\rag-up.ps1 down; .\rag-up.ps1'
+}
+
 function New-Bundle {
     Initialize-Venv
     New-Item -ItemType Directory -Force -Path $Wheels | Out-Null
@@ -713,9 +912,15 @@ function New-Package {
     # anyway. /XF takes a bare name pattern: robocopy rejects a fully qualified
     # path with a wildcard in it outright (invalid parameter), which /XD accepts
     # happily.
+    # The CUDA wheels are excluded unless asked for: they are about 2 GB, which
+    # would more than triple this zip for every target that has no GPU. Use
+    # `package -Gpu` when every machine on the other end has one.
+    $excludeDirs = @((Join-Path $PSScriptRoot '.venv'), (Join-Path $Data 'qdrant'),
+                     (Join-Path $Data 'context-cache'), (Join-Path $PSScriptRoot '.git'))
+    if (-not $Gpu) { $excludeDirs += $GpuWheels }
+
     $null = robocopy $PSScriptRoot $stage /E `
-        /XD (Join-Path $PSScriptRoot '.venv') (Join-Path $Data 'qdrant') `
-            (Join-Path $Data 'context-cache') (Join-Path $PSScriptRoot '.git') `
+        /XD $excludeDirs `
         /XF 'graph.db*' 'ingest-queue.db*' 'extract-cache.db*' 'rag.pid' `
             '*.log' '*.err' 'rag-eval.json'
     if ($LASTEXITCODE -ge 8) { Write-Error "robocopy failed (exit $LASTEXITCODE)" }
@@ -1074,7 +1279,8 @@ switch ($Command) {
         else { Register-Autostart -AsSystem:$System -EveryMinutes $EveryMinutes }
     }
 
-    'bundle' { New-Bundle }
+    'bundle' { New-Bundle; if ($Gpu) { New-GpuBundle } }
+    'gpu' { Install-Gpu }
 
     'package' { New-Package }
 
