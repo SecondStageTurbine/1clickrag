@@ -176,9 +176,20 @@ def scrub(text: str | None) -> str | None:
     ToUnicode map hands back half a surrogate pair, which is not a character
     and never was. Everything downstream eventually encodes - the extraction
     cache compresses UTF-8, the tokeniser wants UTF-8, SQLite wants UTF-8 - so
-    one such code point anywhere in a 16,000-page corpus aborted the ingest
-    with `'utf-8' codec can't encode character '\\ud800'`, naming a codec
-    rather than the file, from a stack that had nothing to do with the PDF.
+    one such code point anywhere in a corpus aborted the whole ingest with
+    `'utf-8' codec can't encode character '\\ud800'`, naming a codec rather
+    than the file, from a stack that had nothing to do with the PDF.
+
+    The reproducer, found by re-running the scan with this function disabled
+    and the extraction cache off - a warm cache hides it, having stored the
+    scrubbed text:
+
+        malformed-to-unicode-cmap-1.7.pdf   ->  '[page 1]\\n\\ud800'
+
+    which is a fixture built deliberately to have a broken ToUnicode CMap, so
+    the mechanism above is not inference. It extracts to nine good characters
+    and then half a character, which is why the original traceback said
+    "position 9".
 
     U+FFFD rather than deletion, for consistency: every other decode here uses
     errors="replace" and therefore already yields U+FFFD for bytes it cannot
