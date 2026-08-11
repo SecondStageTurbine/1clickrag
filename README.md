@@ -674,11 +674,26 @@ pip install --force-reinstall onnxruntime-gpu
 Match the build to the machine's CUDA: the default PyPI wheel wants CUDA 13,
 while CUDA 12 hosts need the separate index documented in `.env.example`.
 
-**Check it actually took.** When the driver libraries are missing, onnxruntime
-logs a warning and runs on the CPU rather than failing — which means a benchmark
-can report a speedup that is CPU both times. `GET /health` reports
-`embed_provider`, which is what onnxruntime chose rather than what was asked
-for; it should say `CUDAExecutionProvider` before you believe any number.
+**Check it actually took**, because the obvious check lies. When the driver
+libraries are missing, onnxruntime logs a warning and runs on the CPU rather
+than failing, so a benchmark reports a small speedup that is CPU on both sides.
+`onnxruntime.get_available_providers()` saying `CUDAExecutionProvider` only
+means a library is present on disk.
+
+```powershell
+python -m app.gpucheck
+```
+
+That asks for evidence a CPU run cannot fabricate: which provider the *loaded
+session* chose, whether GPU memory actually moved, whether it is faster once
+warmed up, and whether the vectors still match the CPU's — a silently different
+embedding would poison an index in a way nothing would report. It also runs a
+negative control with CPU forced and must see CPU, because a check that cannot
+fail proves nothing. Exit code is non-zero until every part passes, and the
+failure says which one did not.
+
+`GET /health` reports `embed_provider` for the same reason, as a standing
+reminder of what onnxruntime chose rather than what was requested.
 
 Changing the model changes the vector width, so follow it with
 `.\rag-up.ps1 reindex -Full` — and it will tell you if you forget, since the
