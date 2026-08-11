@@ -55,6 +55,9 @@ Python and tells you exactly what to do if it is missing.
 | **A chat pane, if you want one** | pick from a dropdown of whatever this machine has — Claude, Codex, Ollama, any OpenAI-compatible endpoint — [chat](#chat-in-the-browser) |
 | **Nothing lost quietly** | changes are queued to disk, retried with backoff, and dead-lettered where you can see them — [how](#nothing-is-indexed-on-a-promise) |
 | **Measurable** | score a retrieval change against questions you know the answers to, instead of guessing — [how](#knowing-whether-a-change-helped) |
+| **Nothing hidden in a config file** | a tab listing every setting, its value now, and where that value came from — [how](#using-it) |
+| **Bring your own embeddings** | point it at a hosted or company-internal embeddings service instead of the built-in model — [how](#somebody-elses-embedding-service) |
+| **Runs on the GPU if you have one** | optional CUDA embedding, with a check that proves it rather than assuming — [how](#embedding-on-the-gpu) |
 | **Cheap to rebuild** | a full reindex reuses the extracted text instead of re-reading every document — [how](#scanned-pages-ocr) |
 | **Says when it is stale** | change a setting that shapes the vectors and it tells you the index no longer matches — [how](#when-a-setting-changes-under-a-built-index) |
 | **A shell client** | project-scoped questions, two query modes, one standard prompt — [PowerShell client](#the-powershell-client-rag-clientpsm1) |
@@ -258,6 +261,14 @@ never printed, because a browser tab gets screen-shared. Same data on
 .\rag-up.ps1 reindex          # only re-embeds what changed; -Full rebuilds
 .\rag-up.ps1 logs
 .\rag-up.ps1 down             # -Wipe also drops the index and model cache
+```
+
+Two more that are Python rather than PowerShell, because they are diagnostics
+rather than everyday commands:
+
+```powershell
+python -m app.evaluate --compare before.json   # did that change help?
+python -m app.gpucheck                         # is the GPU really doing the work?
 ```
 
 **HTTP**
