@@ -131,7 +131,15 @@ class ExtractCache:
         # Level 6 rather than max: prose compresses about four to one either
         # way, and the difference is measured in milliseconds per file against
         # seconds saved per rebuild.
-        body = zlib.compress(text.encode("utf-8"), 6)
+        #
+        # errors="replace" is a second line of defence, not the fix. Callers go
+        # through scanner.load_text, which already removes the lone surrogates
+        # that document extractors emit - but a cache is a side effect of an
+        # ingest, and a side effect must not be able to end it. Before this,
+        # one bad code point in one PDF raised UnicodeEncodeError from inside
+        # zlib.compress and took down the whole run, having successfully
+        # extracted the text it was about to throw away.
+        body = zlib.compress(text.encode("utf-8", "replace"), 6)
         with self._lock:
             self.db.execute(
                 "INSERT OR REPLACE INTO extracts (key, body, bytes, used_at)"

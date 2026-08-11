@@ -779,6 +779,14 @@ releases with no provider wiring at all.
 reason, as a standing reminder of what onnxruntime chose rather than what was
 requested.
 
+**On a host with several GPUs**, set `RAG_GPU_DEVICE`. A provider named as a
+bare string means device 0, so without this every process that never considered
+the question lands on the same card — usually the one someone else is training
+on. Requesting a device that does not exist doesn't fail either; it falls back
+to CPU. `/health` therefore also reports `embed_device` and `rerank_device` as
+the sessions actually bound them, and `python -m app.gpucheck --device 1` probes
+a specific card.
+
 Changing the model changes the vector width, so follow it with
 `.\rag-up.ps1 reindex -Full` — and it will tell you if you forget, since the
 settings that built the index are [recorded and

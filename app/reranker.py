@@ -37,14 +37,17 @@ log = logging.getLogger("rag.reranker")
 
 class Reranker:
     def __init__(self, model: str, cache_dir: str, threads: int = 0,
-                 gpu: bool = False, gpu_setting: str = "RAG_GPU") -> None:
+                 gpu: bool = False, gpu_setting: str = "RAG_GPU",
+                 device: int = 0) -> None:
         self.model_name = model
         self.cache_dir = cache_dir
         self.threads = threads
         self.gpu = gpu
         self.gpu_setting = gpu_setting
+        self.device = device
         self._model = None
         self._provider = accel.CPU
+        self._device: int | None = None
 
     def _load(self):
         if self._model is None:
@@ -55,18 +58,26 @@ class Reranker:
             if self.threads > 0:
                 kwargs["threads"] = self.threads
             # Always explicit, both ways - see accel.chosen().
-            kwargs["providers"] = accel.chosen(self.gpu, self.gpu_setting)
+            kwargs["providers"] = accel.chosen(self.gpu, self.gpu_setting, self.device)
             self._model = TextCrossEncoder(**kwargs)
             # Asked at load rather than trusted from config: a CUDA request that
             # fell back to CPU warns rather than raises, and reporting the
             # request would hide exactly the case worth seeing.
             self._provider = accel.active(self._model, self.gpu)
-            log.info("reranker %s ready on %s", self.model_name, self._provider)
+            self._device = accel.active_device(self._model)
+            log.info(
+                "reranker %s ready on %s%s", self.model_name, self._provider,
+                "" if self._device is None else f" (device {self._device})",
+            )
         return self._model
 
     @property
     def provider(self) -> str:
         return self._provider
+
+    @property
+    def device_in_use(self) -> int | None:
+        return self._device
 
     def prepare(self) -> None:
         self._load()

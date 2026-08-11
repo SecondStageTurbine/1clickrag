@@ -384,6 +384,17 @@ class Config:
     # for the GPU and should get all of it.
     gpu: bool = _env_bool("RAG_GPU", _env_bool("RAG_EMBED_GPU", False))
 
+    # Which CUDA device, on a host with more than one. Ignored when gpu is off.
+    #
+    # Naming a device matters more than it looks: a provider given as a bare
+    # string means device 0, silently, so on a shared multi-GPU box every
+    # process that did not think about this lands on the same card - the one
+    # someone else is probably training on. Asking for a device that does not
+    # exist does not fail either; onnxruntime falls back to the CPU, so
+    # GET /health reports the device the session actually bound to rather than
+    # the one requested.
+    gpu_device: int = _env_int("RAG_GPU_DEVICE", 0)
+
     embed_batch: int = _env_int("RAG_EMBED_BATCH", 32)
     # ONNX inference threads. Defaults to this machine's core count rather than
     # leaving onnxruntime to choose, because a portable copy lands on an unknown

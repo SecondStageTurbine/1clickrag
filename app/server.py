@@ -67,6 +67,7 @@ reranker = (
         # The reranker is the expensive model in the query path, so this is the
         # half of RAG_GPU that a user actually feels.
         gpu=accel.gpu_wanted(CONFIG), gpu_setting=accel.gpu_setting_name(),
+        device=CONFIG.gpu_device,
     )
     if CONFIG.rerank
     else None
@@ -390,6 +391,11 @@ def health():
         # is the difference between a fast search and a five-second one.
         "rerank_provider": getattr(reranker, "provider", None) if reranker else None,
         "rerank_candidates": CONFIG.rerank_candidates if reranker else None,
+        # Which card, not just whether a card. On a shared multi-GPU host the
+        # requested device and the bound one differ silently: asking for a
+        # device that is not there falls back to CPU rather than failing.
+        "embed_device": getattr(embedder, "device_in_use", None),
+        "rerank_device": getattr(reranker, "device_in_use", None) if reranker else None,
         "qdrant": qdrant_ok,
         "vector_store": "embedded" if store.embedded else "server",
         "graph": bool(graph and graph.has_data()),
