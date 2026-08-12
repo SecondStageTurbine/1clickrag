@@ -17,6 +17,24 @@
 # py3-none-win_amd64, so one copy serves every Python version; only
 # onnxruntime-gpu itself is per-interpreter, at roughly 230 MB each.
 #
+# --- licensing, before you redistribute any of this --------------------------
+# onnxruntime-gpu is MIT, but the seven nvidia-* wheels the extras pull in are
+# all LicenseRef-NVIDIA-Proprietary. Two clauses decide what you can do with
+# them, and neither is this project's to waive:
+#
+#   1.2(v)  the terms you distribute your application under must be consistent
+#           with NVIDIA's - which is why `package -Gpu` builds a zip for
+#           internal transfer and the public release carries no CUDA wheels.
+#   2.6     no use "with any system or application where the use or failure ...
+#           can reasonably be expected to threaten or result in personal
+#           injury, death, or catastrophic loss", naming avionics, navigation,
+#           military and medical, absent a separate agreement with NVIDIA.
+#
+# 2.6 is the one to take to whoever approves software where you work, before
+# the wheels arrive rather than after. Large organisations often hold an
+# enterprise agreement that covers it; that is a question with an owner, and
+# the owner is not this file. Full text ships in each wheel's dist-info.
+#
 # --- CUDA 13 hosts (the default PyPI wheels) --------------------------------
 onnxruntime-gpu[cuda,cudnn]>=1.28,<2
 

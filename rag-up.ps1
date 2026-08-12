@@ -1175,6 +1175,19 @@ function New-Package {
         Write-Host '    (no .env packaged - the target keeps or creates its own)'
     }
 
+    if ($Gpu) {
+        # Said plainly and every time, because the difference between the two
+        # zips is invisible once they are sitting in a folder, and only one of
+        # them can be published.
+        Write-Host ''
+        Write-Host '    NOTE: this zip carries NVIDIA CUDA and cuDNN binaries.' -ForegroundColor Yellow
+        Write-Host '    They are LicenseRef-NVIDIA-Proprietary, not MPL - so this build is'
+        Write-Host '    for internal transfer, not for a public release page. Their licence'
+        Write-Host '    also excludes avionics, military and other life-critical use without'
+        Write-Host '    a separate agreement with NVIDIA; see vendor\wheels-gpu for the text.'
+        Write-Host ''
+    }
+
     Write-Host '==> compressing' -ForegroundColor Cyan
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     # Both assemblies: FileSystem carries ZipFile and ZipFileExtensions, while
