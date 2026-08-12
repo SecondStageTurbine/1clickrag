@@ -791,6 +791,20 @@ offline.
 Both switches are opt-in. Without them the CUDA wheels are neither fetched nor
 packaged, so a machine with no GPU still gets a 371 MB wheel set.
 
+> **The CUDA wheels are not redistributable the way the rest of this is.**
+> `onnxruntime-gpu` is MIT, but the seven `nvidia-*` wheels behind the
+> `[cuda,cudnn]` extras are `LicenseRef-NVIDIA-Proprietary`. Their terms
+> require that whatever you distribute be consistent with NVIDIA's licence
+> (1.2 v), which is why the published release here contains **no** CUDA wheels
+> and `package -Gpu` is for internal transfer. The same licence also excludes
+> use "with any system or application where the use or failure ... can
+> reasonably be expected to threaten or result in personal injury, death, or
+> catastrophic loss", naming avionics, navigation, military and medical, absent
+> a separate agreement with NVIDIA (2.6). If that describes where this is
+> going, it is worth raising before the wheels arrive rather than after — many
+> large organisations hold an agreement that covers it. The full text ships in
+> each wheel's `dist-info`.
+
 The `[cuda,cudnn]` extras matter. The bare wheel does not bundle CUDA or cuDNN,
 and without them onnxruntime offers `CUDAExecutionProvider`, accepts it, then
 logs `Failed to create CUDAExecutionProvider. Require cuDNN 9.* and CUDA 13.*`
