@@ -742,29 +742,54 @@ pip uninstall -y onnxruntime
 pip install --force-reinstall "onnxruntime-gpu[cuda,cudnn]"
 ```
 
-**With no internet on the target** — vendor the wheels before you travel, on a
-machine that does have it:
+**For machines with no internet** — vendor the wheels before you travel, on a
+machine that has it:
 
 ```powershell
-.\rag-up.ps1 bundle -Gpu                      # add -Cuda 12 for a CUDA 12 host
-.\rag-up.ps1 package -Gpu                     # include them in the zip
+.\rag-up.ps1 bundle -Gpu       # base wheels + models + CUDA, both generations
+.\rag-up.ps1 package -Gpu      # include them in the zip
 ```
 
-Then `.\rag-up.ps1 gpu` over there installs from `vendor\wheels-gpu` with no
-network. Sizes, because they decide whether this is one zip or two:
+On the other machines there is **nothing to run**. Unzip, double-click
+`Rag.bat`, and the installer detects the card, reads the CUDA version its
+driver supports, installs the matching wheels, proves they work, and only then
+writes `RAG_GPU=1`. That holds for a scripted `-Folder` rollout too, which
+never reaches the setup questions.
+
+None of it is guesswork about the target, which matters because every wrong
+guess here fails the same quiet way — a fall back to the CPU that reports
+success:
+
+| decided on the target | how |
+| --- | --- |
+| is there a GPU | `nvidia-smi` |
+| CUDA 12 or 13 | the version in the `nvidia-smi` header, which is the highest the *driver* supports |
+| which Python | pip resolves against the vendored wheels |
+| did it actually work | `app.gpucheck`, before anything is enabled |
+
+Sizes, which decide whether this is one zip or two:
 
 | | |
 | --- | --- |
-| the seven `nvidia-*` wheels (`py3-none-win_amd64`) | 1,080 MB, one copy serves every Python |
+| the seven `nvidia-*` wheels (`py3-none-win_amd64`) | 1,080 MB per CUDA generation, one copy serves every Python |
 | `onnxruntime-gpu` (per interpreter) | 230 MB each |
-| pack for Python 3.11–3.14 | **2,001 MB** |
-| pack for one known Python version | **1,310 MB** |
+| one generation, Python 3.11–3.14 | **~2.0 GB** |
+| both generations, Python 3.11–3.14 | **~4.0 GB** |
 
-Pinning the interpreter is the biggest lever available — worth doing when the
-target machine's Python is known, which for a managed fleet it usually is.
-Both `bundle -Gpu` and `package -Gpu` are opt-in: without the switch the CUDA
-wheels are neither fetched nor packaged, so a machine with no GPU still gets a
-371 MB wheel set rather than a 2.4 GB one.
+`-Cuda 13` or `-Cuda 12` halves it when the fleet is known to be uniform;
+`both` is the default because a mixed fleet is the case that silently
+half-works. The Python versions are taken from whatever the base wheel set
+already covers, so the two cannot drift apart — override with `-ForPython`.
+
+The pack is checked before you leave: `bundle -Gpu` asks pip to resolve
+`requirements-gpu.txt` against nothing but the vendored directory, once per
+Python version per CUDA generation, and names any combination that fails.
+Counting wheels proves nothing — a set can hold every package and still not
+resolve, and the place that discovers it is otherwise the target machine,
+offline.
+
+Both switches are opt-in. Without them the CUDA wheels are neither fetched nor
+packaged, so a machine with no GPU still gets a 371 MB wheel set.
 
 The `[cuda,cudnn]` extras matter. The bare wheel does not bundle CUDA or cuDNN,
 and without them onnxruntime offers `CUDAExecutionProvider`, accepts it, then
