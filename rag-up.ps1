@@ -1147,7 +1147,13 @@ function New-Bundle {
 # describe a run on this machine and mean nothing on the next one.
 function New-Package {
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('rag-package-' + [guid]::NewGuid().ToString('N'))
-    $zip = Join-Path (Split-Path $PSScriptRoot -Parent) 'rag-portable.zip'
+    # The GPU build gets its own name. Same name would mean a 1 GB zip that can
+    # be published and a 5 GB one that cannot, alternating in place depending on
+    # a switch nobody can see afterwards - and the difference is what NVIDIA's
+    # licence turns on. Two files, two names, no way to grab the wrong one.
+    $zipName = 'rag-portable.zip'
+    if ($Gpu) { $zipName = 'rag-portable-gpu.zip' }
+    $zip = Join-Path (Split-Path $PSScriptRoot -Parent) $zipName
 
     # ZipFile throws DirectoryNotFoundException if the destination folder is
     # absent, which is easy to hit on Windows: a redirected Desktop means
