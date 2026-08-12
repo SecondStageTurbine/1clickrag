@@ -611,6 +611,32 @@ function Initialize-Venv {
     }
 }
 
+function Invoke-VenvPython {
+    <#
+      Run a snippet in the venv's Python without stderr ending the script.
+
+      The same hazard Invoke-Pip exists for, from a different direction: with
+      ErrorActionPreference = 'Stop', anything a native command writes to
+      stderr becomes a terminating NativeCommandError. onnxruntime writes on
+      stderr as a matter of course - a note about a plugin EP device, a warning
+      about a provider it fell back from - and none of it is a failure. It
+      aborted a bundle at the model download, after the wheels were already
+      built, which is the most expensive place to stop.
+
+      Returns $true when the interpreter exited 0.
+    #>
+    param([string]$Code)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $VenvPy -c $Code
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Invoke-Pip {
     # pip reports ordinary things on stderr - a yanked version, a resolver note -
     # and this script runs with $ErrorActionPreference = 'Stop', which turns any
@@ -1084,15 +1110,20 @@ function New-Bundle {
 
     Write-Host '==> pre-downloading the embedding model' -ForegroundColor Cyan
     $env:RAG_MODE = 'native'
-    & $VenvPy -c "from app.config import CONFIG; from app.embedder import make_embedder; make_embedder(CONFIG).prepare(); print('   model cached in', CONFIG.model_cache)"
-    if ($LASTEXITCODE -ne 0) { Write-Error 'model download failed.' }
+    # Fetched on the CPU deliberately. This only needs the weights on disk, and
+    # loading them onto a GPU to download them means onnxruntime writes provider
+    # notes to stderr - which is what ended the bundle here once already.
+    $env:RAG_GPU = '0'
+    $ok = Invoke-VenvPython "from app.config import CONFIG; from app.embedder import make_embedder; make_embedder(CONFIG).prepare(); print('   model cached in', CONFIG.model_cache)"
+    if (-not $ok) { $env:RAG_GPU = $null; Write-Error 'model download failed.' }
 
     # The reranker is fetched whether or not it is currently enabled: it is
     # small next to the embedding model, and the target machine may have no
     # network at all, so "turn on RAG_RERANK later" must not need one.
     Write-Host '==> pre-downloading the reranker (so it can be enabled offline)' -ForegroundColor Cyan
-    & $VenvPy -c "from app.config import CONFIG; from app.reranker import Reranker; Reranker(CONFIG.rerank_model, CONFIG.model_cache).prepare(); print('   reranker cached:', CONFIG.rerank_model)"
-    if ($LASTEXITCODE -ne 0) { Write-Host '    (reranker download failed - it can still be fetched later)' -ForegroundColor Yellow }
+    $ok = Invoke-VenvPython "from app.config import CONFIG; from app.reranker import Reranker; Reranker(CONFIG.rerank_model, CONFIG.model_cache).prepare(); print('   reranker cached:', CONFIG.rerank_model)"
+    if (-not $ok) { Write-Host '    (reranker download failed - it can still be fetched later)' -ForegroundColor Yellow }
+    $env:RAG_GPU = $null
 
     Write-Host ''
     Write-Host '    This folder is now self-contained. Copy it to the other machine' -ForegroundColor Green
