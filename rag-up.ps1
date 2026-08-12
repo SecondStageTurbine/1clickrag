@@ -592,15 +592,21 @@ function Initialize-Venv {
         [System.Security.Cryptography.SHA256]::Create().ComputeHash(
             [System.Text.Encoding]::UTF8.GetBytes($text))).Replace('-', '')
     if (-not (Test-Path $stamp) -or (Get-Content $stamp -Raw).Trim() -ne $sha) {
+        # Invoke-Pip rather than a bare call: pip reports ordinary things on
+        # stderr, and with ErrorActionPreference = Stop that ends the script.
+        # On a machine running the CUDA build it always has something to say,
+        # because fastembed asks for "onnxruntime" and the installed
+        # distribution is named onnxruntime-gpu.
         if ((Test-Path $Wheels) -and (Get-ChildItem $Wheels -File -ErrorAction SilentlyContinue)) {
             Write-Host "==> installing dependencies from $Wheels (offline)" -ForegroundColor Cyan
-            & $VenvPy -m pip install --quiet --no-index --find-links $Wheels -r requirements-native.txt
+            $result = Invoke-Pip @('install', '--quiet', '--no-index', '--find-links', $Wheels,
+                                   '-r', 'requirements-native.txt')
         } else {
             Write-Host '==> installing dependencies (first run only)' -ForegroundColor Cyan
-            & $VenvPy -m pip install --quiet --upgrade pip
-            & $VenvPy -m pip install --quiet -r requirements-native.txt
+            $null = Invoke-Pip @('install', '--quiet', '--upgrade', 'pip')
+            $result = Invoke-Pip @('install', '--quiet', '-r', 'requirements-native.txt')
         }
-        if ($LASTEXITCODE -ne 0) { Show-InstallHelp; Write-Error 'dependency install failed.' }
+        if (-not $result.Ok) { Write-Host $result.Output; Show-InstallHelp; Write-Error 'dependency install failed.' }
         Set-Content -Path $stamp -Value $sha
     }
 }
@@ -671,6 +677,13 @@ function Test-BundleResolves {
 # Prepare this folder to be carried to a machine with no internet access:
 # vendor the wheels and pre-download the model, so rag-up there needs neither
 # PyPI nor huggingface.co.
+function Test-OnnxGpuInstalled {
+    # Whether the CUDA build is the one installed. Asked of pip rather than of
+    # rag\.env: the setting records an intention, and this is the fact.
+    $result = Invoke-Pip @('show', 'onnxruntime-gpu')
+    return $result.Ok
+}
+
 function Initialize-GpuIfBundled {
     <#
       Turn the GPU on by itself, when everything needed is already here.
@@ -686,7 +699,23 @@ function Initialize-GpuIfBundled {
       yet - and Install-Gpu still writes RAG_GPU=1 only if the proof passes.
       An explicit RAG_GPU=0 is a decision and is left alone.
     #>
-    if ($null -ne (Get-EnvValue 'RAG_GPU')) { return }
+    $recorded = Get-EnvValue 'RAG_GPU'
+    if ($recorded -eq '1') {
+        # Already decided yes - but check it is still true. Installing the base
+        # requirements pulls onnxruntime back in, because fastembed depends on
+        # it by name and the CUDA build answers to a different one, and the two
+        # cannot coexist. So any change to requirements.txt would quietly put a
+        # working fleet back on the CPU, with RAG_GPU=1 still in .env insisting
+        # otherwise. /health would show it; nothing else would.
+        if (-not (Test-OnnxGpuInstalled)) {
+            Write-Host ''
+            Write-Host '==> RAG_GPU=1, but the CPU onnxruntime is what is installed' -ForegroundColor Yellow
+            Write-Host '    (a dependency reinstall reverts it) - putting CUDA back'
+            Install-Gpu
+        }
+        return
+    }
+    if ($null -ne $recorded) { return }   # an explicit 0 is a decision
     if (-not (Get-NvidiaGpu)) { return }
     $major = Get-HostCudaMajor
     if (-not $major) { return }
@@ -998,8 +1027,14 @@ function New-Bundle {
     # installing an sdist offline fails: pip's build isolation tries to fetch
     # setuptools from a network the target machine does not have. `pip wheel`
     # builds it here, so the bundle is wheels only and the target never builds.
-    & $VenvPy -m pip wheel --quiet -r requirements-native.txt -w $Wheels
-    if ($LASTEXITCODE -ne 0) { Write-Error 'wheel build failed.' }
+    # Through Invoke-Pip, like everything else here. pip writes ordinary things
+    # to stderr, and with ErrorActionPreference = Stop that is fatal - which it
+    # became the moment this machine had onnxruntime-gpu installed, because pip
+    # then notes that fastembed "requires onnxruntime, which is not installed".
+    # A true statement about a package name, not a problem, and it aborted the
+    # whole bundle.
+    $result = Invoke-Pip @('wheel', '--quiet', '-r', 'requirements-native.txt', '-w', $Wheels)
+    if (-not $result.Ok) { Write-Host $result.Output; Write-Error 'wheel build failed.' }
 
     # Binary wheels (onnxruntime, numpy, pydantic-core, lxml) are built per
     # Python minor version. Wheels for THIS Python are useless on a machine
