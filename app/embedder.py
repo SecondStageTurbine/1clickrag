@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MPL-2.0
-"""Embedding backends. Nothing leaves the machine in either case.
+"""Embedding backends for in-process, Ollama, or explicitly configured HTTP use.
 
 * ``FastEmbedEmbedder`` - in-process ONNX (the fastembed package). No daemon,
-  no container; weights are downloaded once into a local cache directory.
+  no container; weights are downloaded once into a local cache directory, or
+  required to be staged already when dark-network mode is enabled.
 * ``OllamaEmbedder``    - a local Ollama HTTP server, used by the compose stack
   and by anyone who already runs Ollama for other reasons.
 
@@ -35,13 +36,14 @@ class FastEmbedEmbedder:
 
     def __init__(self, model: str, cache_dir: str, threads: int = 0,
                  gpu: bool = False, gpu_setting: str = "RAG_GPU",
-                 device: int = 0) -> None:
+                 device: int = 0, offline: bool = False) -> None:
         self.model_name = model
         self.cache_dir = cache_dir
         self.threads = threads
         self.gpu = gpu
         self.gpu_setting = gpu_setting
         self.device = device
+        self.offline = offline
         self._model = None
         self._dim: int | None = None
         self._provider = accel.CPU
@@ -57,12 +59,16 @@ class FastEmbedEmbedder:
                     "(pip install -r requirements.txt), or set RAG_MODE=docker"
                 ) from exc
             os.makedirs(self.cache_dir, exist_ok=True)
-            log.info(
-                "loading embedding model %s (first run downloads it into %s)",
-                self.model_name,
-                self.cache_dir,
-            )
+            if self.offline:
+                log.info("loading staged embedding model %s", self.model_name)
+            else:
+                log.info(
+                    "loading embedding model %s (first run downloads it into %s)",
+                    self.model_name, self.cache_dir,
+                )
             kwargs = {"model_name": self.model_name, "cache_dir": self.cache_dir}
+            if self.offline:
+                kwargs["local_files_only"] = True
             if self.threads > 0:
                 kwargs["threads"] = self.threads
             # Always explicit, both ways - see accel.chosen().
@@ -381,6 +387,19 @@ class HttpEmbedder:
 
 
 def make_embedder(cfg):
+    embedder = _make_backend(cfg)
+    if getattr(cfg, "embed_cache", True) and getattr(cfg, "embed_cache_max_mb", 512) > 0:
+        from .embedding_cache import CachedEmbedder
+        from .embedding_contract import fingerprint
+
+        return CachedEmbedder(
+            embedder, cfg.embed_cache_path, fingerprint(cfg),
+            cfg.embed_cache_max_mb * 1024 * 1024,
+        )
+    return embedder
+
+
+def _make_backend(cfg):
     if cfg.embed_backend == "ollama":
         return OllamaEmbedder(cfg.ollama_url, cfg.embed_model)
     if cfg.embed_backend in ("http", "openai"):
@@ -405,6 +424,7 @@ def make_embedder(cfg):
             cfg.embed_model, cfg.model_cache, getattr(cfg, "embed_threads", 0),
             gpu=accel.gpu_wanted(cfg), gpu_setting=accel.gpu_setting_name(),
             device=getattr(cfg, "gpu_device", 0),
+            offline=getattr(cfg, "dark_network", False),
         )
     raise EmbeddingError(
         f"unknown RAG_EMBED_BACKEND={cfg.embed_backend!r} "

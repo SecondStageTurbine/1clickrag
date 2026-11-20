@@ -136,6 +136,11 @@ def snapshot(cfg, example_path: str = "") -> dict:
     # What is both true and useful is whether the value was set explicitly, so
     # that is what is reported.
     rebuild = set(manifest_module.REBUILD_FIELDS)
+    rebuild.add("embed_revision")
+    if cfg.embed_backend in ("http", "openai"):
+        rebuild.update(("embed_url", "embed_doc_prefix", "embed_query_prefix"))
+    elif cfg.embed_backend == "ollama":
+        rebuild.add("ollama_url")
     content = set(manifest_module.CONTENT_FIELDS)
 
     items: list[dict] = []
