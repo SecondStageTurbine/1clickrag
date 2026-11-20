@@ -269,6 +269,14 @@ class OpenAIProvider(Provider):
             return "no model set - RAG_CHAT_MODEL is required for this provider"
         if not self.local and not self._key:
             return "no API key - set RAG_CHAT_API_KEY in rag/.env"
+        if self.local:
+            # A configured model name proves nothing about whether its local
+            # runner survived a reboot. Any HTTP response proves the process is
+            # there; /models is standard, but a 404 is still useful reachability.
+            try:
+                httpx.get(f"{self._base}/models", timeout=3.0)
+            except httpx.RequestError:
+                return f"no local chat service answering at {self._base}"
         return None
 
     def stream(self, system: str, messages: list[dict]) -> Iterator[str]:
@@ -642,7 +650,11 @@ def discover(cfg) -> list[Provider]:
         provider.label = f"{model} (local)"
         backends.append(provider)
 
-    backends.extend(_cli_backends(cfg))
+    # Signed-in agent CLIs are normally useful discovery, but their network
+    # destination is controlled outside this process. Do not offer them where
+    # the application is required to prove its endpoint boundary.
+    if not getattr(cfg, "dark_network", False):
+        backends.extend(_cli_backends(cfg))
     return backends
 
 

@@ -25,6 +25,21 @@ if [ -z "$PORT" ] && [ -f .env ]; then
 fi
 PORT="${PORT:-49404}"   # must match RAG_PORT default in app/config.py
 
+DARK_NETWORK="${RAG_DARK_NETWORK:-}"
+if [ -z "$DARK_NETWORK" ] && [ -f .env ]; then
+  DARK_NETWORK="$(sed -n 's/^[[:space:]]*RAG_DARK_NETWORK[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p' .env | tail -1)"
+fi
+case "$(printf '%s' "$DARK_NETWORK" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) DARK_NETWORK=1 ;;
+  *) DARK_NETWORK=0 ;;
+esac
+if [ "$DARK_NETWORK" = 1 ]; then
+  export PIP_NO_INDEX=1
+  export PIP_DISABLE_PIP_VERSION_CHECK=1
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+fi
+
 API="http://127.0.0.1:$PORT"
 DATA=".data"
 VENV=".venv"
@@ -173,6 +188,8 @@ wait_for_health() {
       if [ "$status" != "$last" ]; then
         echo "    status: $status"
         last="$status"
+        # The UI serves from the first chunk; only the launcher was waiting.
+        [ "$status" = "indexing" ] && echo "    UI is up now at $API - search works on what is indexed so far"
       fi
       # A big corpus spends a long time here; show it moving.
       if [ "$status" = "indexing" ]; then
@@ -237,6 +254,11 @@ native_venv() {
       "$PY" -m pip install --quiet --no-index --find-links "$WHEELS" -r requirements-native.txt || {
         install_help; exit 1; }
     else
+      if [ "$DARK_NETWORK" = 1 ]; then
+        echo "error: dark-network mode will not contact PyPI." >&2
+        echo "vendor/wheels is missing; build the offline bundle on an approved connected staging machine." >&2
+        exit 1
+      fi
       echo "==> installing dependencies (first run only)"
       "$PY" -m pip install --quiet --upgrade pip
       "$PY" -m pip install --quiet -r requirements-native.txt || { install_help; exit 1; }
@@ -249,6 +271,11 @@ native_venv() {
 # vendor the wheels and pre-download the model, so `rag-up` there needs neither
 # PyPI nor huggingface.co.
 cmd_bundle() {
+  if [ "$DARK_NETWORK" = 1 ]; then
+    echo "error: bundle downloads supply-chain inputs and is disabled by RAG_DARK_NETWORK=1." >&2
+    echo "Build it on the approved connected staging machine." >&2
+    exit 1
+  fi
   native_venv
   mkdir -p "$WHEELS"
   echo "==> building wheels into $WHEELS"
@@ -291,8 +318,12 @@ native_up() {
   native_venv
 
   echo "==> starting the RAG server"
-  echo "    (first run downloads the embedding model, then indexes the repo;"
-  echo "     later starts reuse both and are seconds)"
+  if [ "$DARK_NETWORK" = 1 ]; then
+    echo "    dark-network mode: staged packages/models only; no cloud fallback"
+  else
+    echo "    (first run downloads the embedding model, then indexes the repo;"
+    echo "     later starts reuse both and are seconds)"
+  fi
   RAG_MODE=native "$PY" -m app.server >"$LOGFILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PIDFILE"
@@ -340,8 +371,13 @@ native_down() {
 # ------------------------------------------------------------ docker mode
 
 docker_up() {
-  echo "==> building and starting the containerised stack"
-  compose up -d --build
+  if [ "$DARK_NETWORK" = 1 ]; then
+    echo "==> starting preloaded container images (builds/pulls disabled)"
+    compose up -d --no-build --pull never
+  else
+    echo "==> building and starting the containerised stack"
+    compose up -d --build
+  fi
   echo "==> waiting for the index"
   wait_for_health || { echo "error: not healthy. Check: ./rag-up.sh --docker logs" >&2; return 1; }
 }

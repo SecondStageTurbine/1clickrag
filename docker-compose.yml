@@ -5,9 +5,9 @@
 #   cd rag && docker compose up -d      (or: ./rag-up.sh / .\rag-up.ps1)
 #   open http://127.0.0.1:8404
 #
-# Nothing leaves the machine and nothing is published beyond loopback: every
-# port is bound to 127.0.0.1 explicitly, so the index is not reachable from the
-# LAN even on a laptop with a permissive firewall.
+# Runtime service ports are published only on loopback. Dark-network mode also
+# disables service telemetry/cloud features and starts only preloaded images;
+# outside that mode, the initial image build and model pull need a network.
 #
 # To point this at a DIFFERENT repository, set RAG_REPO_PATH (host path) in
 # rag/.env — no other change is needed.
@@ -21,6 +21,8 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant-storage:/qdrant/storage
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
 
   ollama:
     image: ollama/ollama:0.5.4
@@ -30,6 +32,8 @@ services:
       - "127.0.0.1:11434:11434"
     volumes:
       - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_NO_CLOUD: "1"
     # GPU (optional, big speedup on first ingest). Uncomment with the NVIDIA
     # container toolkit installed; CPU works fine for an embedding model.
     # deploy:
@@ -55,11 +59,20 @@ services:
     volumes:
       # The corpus. Read-only: the indexer never writes to your source tree.
       - ${RAG_REPO_PATH:-..}:/repo:ro
+      - embedding-cache:/embedding-cache
     environment:
       RAG_MODE: docker
+      RAG_DARK_NETWORK: ${RAG_DARK_NETWORK:-0}
+      # The API must listen on the container interface; the host-side port
+      # remains explicitly bound to 127.0.0.1 above.
+      RAG_DARK_NETWORK_ALLOW_REMOTE: "1"
       RAG_QDRANT_URL: http://qdrant:6333
       RAG_OLLAMA_URL: http://ollama:11434
       RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-nomic-embed-text}
+      RAG_EMBED_REVISION: ${RAG_EMBED_REVISION:-}
+      RAG_EMBED_CACHE: ${RAG_EMBED_CACHE:-1}
+      RAG_EMBED_CACHE_MAX_MB: ${RAG_EMBED_CACHE_MAX_MB:-512}
+      RAG_EMBED_CACHE_PATH: /embedding-cache/vectors.db
       RAG_COLLECTION: ${RAG_COLLECTION:-codebase}
       RAG_REPO_LABEL: ${RAG_REPO_LABEL:-corpus}
       RAG_WATCH: ${RAG_WATCH:-1}
@@ -68,3 +81,4 @@ services:
 volumes:
   qdrant-storage:
   ollama-models:
+  embedding-cache:

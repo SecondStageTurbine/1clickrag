@@ -38,13 +38,14 @@ log = logging.getLogger("rag.reranker")
 class Reranker:
     def __init__(self, model: str, cache_dir: str, threads: int = 0,
                  gpu: bool = False, gpu_setting: str = "RAG_GPU",
-                 device: int = 0) -> None:
+                 device: int = 0, offline: bool = False) -> None:
         self.model_name = model
         self.cache_dir = cache_dir
         self.threads = threads
         self.gpu = gpu
         self.gpu_setting = gpu_setting
         self.device = device
+        self.offline = offline
         self._model = None
         self._provider = accel.CPU
         self._device: int | None = None
@@ -53,8 +54,13 @@ class Reranker:
         if self._model is None:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-            log.info("loading reranker %s (first run downloads it)", self.model_name)
+            if self.offline:
+                log.info("loading staged reranker %s", self.model_name)
+            else:
+                log.info("loading reranker %s (first run downloads it)", self.model_name)
             kwargs = {"model_name": self.model_name, "cache_dir": self.cache_dir}
+            if self.offline:
+                kwargs["local_files_only"] = True
             if self.threads > 0:
                 kwargs["threads"] = self.threads
             # Always explicit, both ways - see accel.chosen().
