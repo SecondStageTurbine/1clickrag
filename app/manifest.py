@@ -38,6 +38,8 @@ import logging
 import os
 import time
 
+from .embedding_contract import fingerprint
+
 log = logging.getLogger("rag.manifest")
 
 FORMAT = 1
@@ -47,6 +49,7 @@ FORMAT = 1
 REBUILD_FIELDS = (
     "embed_model",
     "embed_backend",
+    "embed_fingerprint",
     "vector_dim",
     "embed_path",
     "embed_label",
@@ -63,6 +66,15 @@ CONTENT_FIELDS = (
     "ocr_overlap",
     "ocr_min_confidence",
     "archives",
+    "pdf_attachments",
+    "pdf_attachment_max_bytes",
+    "pdf_attachment_max_members",
+    "pdf_attachment_max_total_bytes",
+    "pdf_attachment_max_temp_bytes",
+    "diagrams",
+    "diagram_scale",
+    "diagram_min_confidence",
+    "diagram_max_pages",
     "extra_text_exts",
     "pdf_keep_boilerplate",
 )
@@ -72,6 +84,7 @@ CONTENT_FIELDS = (
 LABELS = {
     "embed_model": "the embedding model",
     "embed_backend": "the embedding backend",
+    "embed_fingerprint": "the embedding configuration (prefixes, endpoint, revision or runtime)",
     "vector_dim": "the vector width",
     "embed_path": "how much of the path is embedded",
     "embed_label": "the embedded label",
@@ -83,6 +96,15 @@ LABELS = {
     "ocr_overlap": "the OCR band overlap",
     "ocr_min_confidence": "the OCR confidence floor",
     "archives": "reading inside archives",
+    "pdf_attachments": "reading spreadsheet attachments inside PDFs",
+    "pdf_attachment_max_bytes": "the per-attachment size limit",
+    "pdf_attachment_max_members": "the PDF attachment count limit",
+    "pdf_attachment_max_total_bytes": "the total PDF attachment size limit",
+    "pdf_attachment_max_temp_bytes": "the PDF attachment temporary-storage limit",
+    "diagrams": "reading diagram topology from PDFs",
+    "diagram_scale": "the diagram render scale",
+    "diagram_min_confidence": "the diagram confidence floor",
+    "diagram_max_pages": "the diagram page limit",
     "extra_text_exts": "the extra text extensions",
     "pdf_keep_boilerplate": "keeping PDF headers and footers",
 }
@@ -96,6 +118,7 @@ def current(cfg, vector_dim: int | None = None) -> dict:
         "collection": cfg.collection,
         "embed_model": cfg.embed_model,
         "embed_backend": cfg.embed_backend,
+        "embed_fingerprint": fingerprint(cfg),
         "vector_dim": vector_dim,
         "embed_path": cfg.embed_path,
         "embed_label": cfg.embed_label,
@@ -107,6 +130,15 @@ def current(cfg, vector_dim: int | None = None) -> dict:
         "ocr_overlap": cfg.ocr_overlap,
         "ocr_min_confidence": cfg.ocr_min_confidence,
         "archives": bool(cfg.archives),
+        "pdf_attachments": bool(cfg.pdf_attachments),
+        "pdf_attachment_max_bytes": cfg.pdf_attachment_max_bytes,
+        "pdf_attachment_max_members": cfg.pdf_attachment_max_members,
+        "pdf_attachment_max_total_bytes": cfg.pdf_attachment_max_total_bytes,
+        "pdf_attachment_max_temp_bytes": cfg.pdf_attachment_max_temp_bytes,
+        "diagrams": bool(cfg.diagrams),
+        "diagram_scale": cfg.diagram_scale,
+        "diagram_min_confidence": cfg.diagram_min_confidence,
+        "diagram_max_pages": cfg.diagram_max_pages,
         # Sorted so a dict's iteration order cannot masquerade as a change.
         "extra_text_exts": sorted(cfg.extra_text_exts.items()),
         "pdf_keep_boilerplate": bool(os.environ.get("RAG_PDF_KEEP_BOILERPLATE")),

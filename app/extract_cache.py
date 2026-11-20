@@ -47,7 +47,7 @@ SCHEMA_VERSION = 1
 # Bump when an extractor's output changes for input it already handled, so
 # every entry made by the old code is bypassed. Config-driven differences do
 # not need this - they are in the profile - but a bug fix in a reader does.
-EXTRACTOR_VERSION = 1
+EXTRACTOR_VERSION = 4
 
 
 def _profile(cfg) -> str:
@@ -61,6 +61,8 @@ def _profile(cfg) -> str:
         f"minchars={cfg.ocr_min_chars}",
         f"mpx={cfg.ocr_max_megapixels}",
         f"pdfboiler={int(bool(os.environ.get('RAG_PDF_KEEP_BOILERPLATE')))}",
+        f"diagramreview={int(bool(cfg.diagram_review))}",
+        f"diagramreviewdir={os.path.abspath(cfg.diagram_review_dir)}",
         f"members={cfg.archive_max_members}",
         f"extra={sorted(cfg.extra_text_exts.items())}",
     ]

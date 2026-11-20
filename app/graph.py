@@ -34,14 +34,19 @@ from collections import defaultdict
 
 from .chunker import Chunk
 from .entities import extract_entities, normalise_key
+from .relationships import extract_relationships
 
 log = logging.getLogger("rag.graph")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Bare words for the MATCH expression. Everything else is punctuation as far as
 # the unicode61 tokenizer is concerned, so a query keeps only what can match.
 TERM = re.compile(r"[^\W_]+", re.UNICODE)
+# Structured supplier identifiers often contain punctuation that FTS tokenizes
+# away: APU_SPEED_SENSOR_1_OPEN_SHORT and ARINC label 350:11 are the real
+# examples that motivated this. Keep them whole for exact entity resolution.
+STRUCTURED_TERM = re.compile(r"[A-Za-z0-9][A-Za-z0-9'&./_:-]*")
 MAX_TERMS = 24
 
 
@@ -129,6 +134,22 @@ class Graph:
                     PRIMARY KEY (entity_id, chunk_id)
                 ) WITHOUT ROWID;
                 CREATE INDEX IF NOT EXISTS mentions_chunk ON mentions(chunk_id);
+
+                CREATE TABLE IF NOT EXISTS relationships (
+                    subject_id INTEGER NOT NULL,
+                    predicate  TEXT    NOT NULL,
+                    object_id  INTEGER NOT NULL,
+                    chunk_id   INTEGER NOT NULL,
+                    confidence REAL    NOT NULL DEFAULT 1.0,
+                    inference  TEXT    NOT NULL DEFAULT 'explicit',
+                    PRIMARY KEY (subject_id, predicate, object_id, chunk_id)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS relationships_subject
+                    ON relationships(subject_id);
+                CREATE INDEX IF NOT EXISTS relationships_object
+                    ON relationships(object_id);
+                CREATE INDEX IF NOT EXISTS relationships_chunk
+                    ON relationships(chunk_id);
                 """
             )
             self.db.execute(
@@ -141,6 +162,7 @@ class Graph:
         self.db.executescript(
             """
             DROP TABLE IF EXISTS mentions;
+            DROP TABLE IF EXISTS relationships;
             DROP TABLE IF EXISTS entities;
             DROP TABLE IF EXISTS chunk_fts;
             DROP TABLE IF EXISTS chunks;
@@ -156,6 +178,7 @@ class Graph:
             self.db.executescript(
                 """
                 DELETE FROM mentions;
+                DELETE FROM relationships;
                 DELETE FROM entities;
                 DELETE FROM chunk_fts;
                 DELETE FROM chunks;
@@ -205,6 +228,7 @@ class Graph:
             )
         }
         placeholders = ",".join("?" * len(ids))
+        self.db.execute(f"DELETE FROM relationships WHERE chunk_id IN ({placeholders})", ids)
         self.db.execute(f"DELETE FROM mentions WHERE chunk_id IN ({placeholders})", ids)
         self.db.execute(f"DELETE FROM chunk_fts WHERE rowid IN ({placeholders})", ids)
         self.db.execute(f"DELETE FROM chunks WHERE id IN ({placeholders})", ids)
@@ -242,11 +266,15 @@ class Graph:
                 )
 
                 for mention in extract_entities(chunk.text):
-                    row = self.db.execute(
+                    self.db.execute(
                         "INSERT INTO entities(name, key, kind, doc_count) VALUES (?,?,?,0)"
-                        " ON CONFLICT(key) DO UPDATE SET name = entities.name"
-                        " RETURNING id",
+                        " ON CONFLICT(key) DO NOTHING",
                         (mention.name, mention.key, mention.kind),
+                    )
+                    # RHEL 9 ships SQLite 3.34, before RETURNING was added.
+                    # The existing write lock/transaction covers this lookup.
+                    row = self.db.execute(
+                        "SELECT id FROM entities WHERE key = ?", (mention.key,),
                     ).fetchone()
                     entity_id = row["id"]
                     touched.add(entity_id)
@@ -257,10 +285,55 @@ class Graph:
                         (entity_id, chunk_id, mention.count),
                     )
 
+                # Typed edges come only from structured spreadsheet rows or
+                # detected diagram geometry. Their evidence is the chunk that
+                # produced them, so re-indexing cannot leave stale edges.
+                for relation in extract_relationships(chunk.text):
+                    subject_id = self._upsert_entity(
+                        relation.subject, relation.subject_kind,
+                        chunk.path if relation.subject_kind == "page_reference" else "",
+                    )
+                    object_id = self._upsert_entity(
+                        relation.object, relation.object_kind,
+                        chunk.path if relation.object_kind == "page_reference" else "",
+                    )
+                    touched.update((subject_id, object_id))
+                    for entity_id in (subject_id, object_id):
+                        self.db.execute(
+                            "INSERT INTO mentions(entity_id, chunk_id, count) VALUES (?,?,1)"
+                            " ON CONFLICT(entity_id, chunk_id) DO NOTHING",
+                            (entity_id, chunk_id),
+                        )
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO relationships"
+                        "(subject_id, predicate, object_id, chunk_id, confidence, inference)"
+                        " VALUES (?,?,?,?,?,?)",
+                        (subject_id, relation.predicate, object_id, chunk_id,
+                         relation.confidence, relation.inference),
+                    )
+
             self._refresh_doc_counts(touched)
             self._total_docs = None
             self.db.commit()
             return len(chunks)
+
+    def _upsert_entity(self, name: str, kind: str, scope: str = "") -> int:
+        key = normalise_key(name)
+        if scope:
+            # Page numbers are meaningful only within one document. Without
+            # this internal scope, "Page 5" in every PDF becomes one global
+            # hub and cross-page retrieval jumps between unrelated manuals.
+            key = f"{key}\x1f{normalise_key(scope)}"
+        self.db.execute(
+            "INSERT INTO entities(name, key, kind, doc_count) VALUES (?,?,?,0)"
+            " ON CONFLICT(key) DO UPDATE SET"
+            " name = CASE WHEN entities.name = '' THEN excluded.name ELSE entities.name END,"
+            " kind = CASE WHEN entities.kind IN ('name','identifier')"
+            "             THEN excluded.kind ELSE entities.kind END",
+            (name, key, kind),
+        )
+        row = self.db.execute("SELECT id FROM entities WHERE key = ?", (key,)).fetchone()
+        return int(row["id"])
 
     def _refresh_doc_counts(self, entity_ids: set[int]) -> None:
         """Recompute document frequency for the entities this file touched.
@@ -368,6 +441,12 @@ class Graph:
                 "documents": self.total_docs(),
                 "entities": scalar("SELECT COUNT(*) AS n FROM entities"),
                 "mentions": scalar("SELECT COUNT(*) AS n FROM mentions"),
+                "relationships": scalar("SELECT COUNT(*) AS n FROM relationships"),
+                "diagram_relationships": scalar(
+                    "SELECT COUNT(*) AS n FROM relationships "
+                    "WHERE inference IN ('diagram_geometry', 'diagram_layout', "
+                    "'explicit_page_reference', 'reciprocal_page_reference')"
+                ),
                 "df_ceiling": self.df_ceiling(),
                 "bytes": size,
             }
@@ -456,6 +535,21 @@ class Graph:
                 key = normalise_key(phrase)
                 if key and key not in candidates:
                     candidates[key] = phrase
+
+        # Also retain punctuation-bearing tokens as a whole. This supplements
+        # the word n-grams rather than replacing them, so ordinary names keep
+        # their existing matching behaviour.
+        for token in STRUCTURED_TERM.findall(text):
+            key = normalise_key(token)
+            if key:
+                candidates.setdefault(key, token)
+
+        # An exact structured value may contain characters outside either
+        # tokenizer. Looking up the complete query is cheap and harmless when
+        # it is an ordinary sentence because no entity will have that key.
+        whole = text.strip()
+        if whole:
+            candidates.setdefault(normalise_key(whole), whole)
 
         # Identifiers keep punctuation the tokenizer would have thrown away.
         for mention in extract_entities(text, max_entities=16):
@@ -658,6 +752,79 @@ class Graph:
             ],
             top_k,
         )
+
+    def relationship_search(
+        self,
+        text: str,
+        top_k: int,
+        language_filter: str | None = None,
+        path_prefix: str | None = None,
+    ) -> tuple[list[dict], list[dict]]:
+        """Retrieve through typed, evidence-backed relationships.
+
+        The question resolves to known entities, explicit edges provide the
+        linked entities, and normal chunk lookup finds those values anywhere
+        in the corpus.  This is a separate ranking arm so vector and BM25
+        retrieval remain intact.
+        """
+        seeds = self.resolve_entities(text)
+        if not seeds:
+            return [], []
+        seed_ids = [int(seed["id"]) for seed in seeds]
+        placeholders = ",".join("?" * len(seed_ids))
+        sql = f"""
+            SELECT r.subject_id, r.predicate, r.object_id, r.confidence,
+                   r.inference, s.name AS subject, s.kind AS subject_kind,
+                   o.name AS object, o.kind AS object_kind,
+                   c.path, c.section, c.start_line, c.end_line
+              FROM relationships r
+              JOIN entities s ON s.id = r.subject_id
+              JOIN entities o ON o.id = r.object_id
+              JOIN chunks c   ON c.id = r.chunk_id
+             WHERE r.subject_id IN ({placeholders})
+                OR r.object_id IN ({placeholders})
+             ORDER BY r.confidence DESC, r.predicate
+             LIMIT ?
+        """
+        with self._lock:
+            rows = self.db.execute(sql, seed_ids + seed_ids + [max(top_k * 4, 20)]).fetchall()
+
+        linked_ids: list[int] = []
+        linked_seen: set[int] = set()
+        facts: list[dict] = []
+        seen_ids = set(seed_ids)
+        seen_facts: set[tuple] = set()
+        for row in rows:
+            other_id = int(row["object_id"] if row["subject_id"] in seen_ids
+                           else row["subject_id"])
+            if other_id not in linked_seen:
+                linked_seen.add(other_id)
+                linked_ids.append(other_id)
+            key = (row["subject_id"], row["predicate"], row["object_id"], row["path"])
+            if key in seen_facts:
+                continue
+            seen_facts.add(key)
+            facts.append({
+                "subject": row["subject"],
+                "subject_kind": row["subject_kind"],
+                "predicate": row["predicate"],
+                "object": row["object"],
+                "object_kind": row["object_kind"],
+                "confidence": float(row["confidence"]),
+                "inference": row["inference"],
+                "section": row["section"],
+                "citation": f"{row['path']}:{row['start_line']}-{row['end_line']}",
+            })
+
+        hits = self.chunks_for_entities(
+            linked_ids,
+            top_k=top_k,
+            language_filter=language_filter,
+            path_prefix=path_prefix,
+        )
+        for hit in hits:
+            hit["relationships"] = facts[:10]
+        return hits, facts[:20]
 
     def link(self, a_id: int, b_id: int, limit: int = 3) -> list[dict]:
         """The chunks that put two entities in the same place.
