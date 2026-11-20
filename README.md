@@ -695,6 +695,15 @@ Then, if it should stay up on its own:
 .\rag-up.ps1 autostart
 ```
 
+### RHEL 9 with NVIDIA GPUs
+
+For a Linux server there is a separate offline bundle under `deploy/rhel/`:
+Python 3.12 wheels, the CUDA runtime and cuDNN, and the two default models, with
+no Docker needed on the target. Install it with
+`bash deploy/rhel/rag-rhel.sh install`; if the GPU is not being used,
+`rag-rhel.sh probe` prints why. Build steps, target requirements and validation
+are in [deploy/rhel/README.md](deploy/rhel/README.md).
+
 ### What to copy, and what not to
 
 | Item | Copy it? | Why |
