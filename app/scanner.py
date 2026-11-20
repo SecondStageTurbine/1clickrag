@@ -78,6 +78,24 @@ def iter_archive_members(rel_path: str, cfg: Config) -> Iterator[tuple[str, str]
         yield f"{rel_path}{SEPARATOR}{member}", language
 
 
+def iter_pdf_attachments(rel_path: str, cfg: Config) -> Iterator[tuple[str, str]]:
+    """Yield supported spreadsheet attachments as PDF virtual children."""
+    from .archive import SEPARATOR
+    from .pdf_attachments import list_attachments
+
+    abs_path = os.path.join(cfg.repo_path, rel_path)
+    for member, _size in list_attachments(
+        abs_path,
+        cfg.archive_max_bytes,
+        cfg.pdf_attachment_max_bytes,
+        cfg.pdf_attachment_max_members,
+        cfg.pdf_attachment_max_total_bytes,
+    ):
+        language = language_for(member, cfg)
+        if language is not None:
+            yield f"{rel_path}{SEPARATOR}{member}", language
+
+
 def iter_source_files(cfg: Config) -> Iterator[tuple[str, str]]:
     """Yield (repo-relative path, language) for every indexable file.
 
@@ -113,6 +131,8 @@ def iter_source_files(cfg: Config) -> Iterator[tuple[str, str]]:
             if language is None:
                 continue
             yield rel_path, language
+            if cfg.pdf_attachments and os.path.splitext(filename)[1].lower() == ".pdf":
+                yield from iter_pdf_attachments(rel_path, cfg)
 
 
 def unsupported_counts(cfg: Config) -> dict[str, int]:

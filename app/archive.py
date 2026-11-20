@@ -24,6 +24,7 @@ import zipfile
 log = logging.getLogger("rag.archive")
 
 ARCHIVE_EXTS = {".zip"}
+MEMBER_CONTAINER_EXTS = ARCHIVE_EXTS | {".pdf"}
 
 # Separates the archive from the member. Only ever interpreted when the left
 # side ends in a known archive extension, so a literal "!" in a filename is not
@@ -40,7 +41,7 @@ def split_member(path: str) -> tuple[str, str] | None:
     index = path.rfind(SEPARATOR)
     while index > 0:
         outer = path[:index]
-        if is_archive(outer):
+        if os.path.splitext(outer)[1].lower() in MEMBER_CONTAINER_EXTS:
             return outer, path[index + 1 :]
         index = path.rfind(SEPARATOR, 0, index)
     return None
@@ -88,6 +89,33 @@ def read_member(abs_path: str, member: str, max_bytes: int) -> str | None:
     """
     from .scanner import read_text
     from .extract import extract, is_document
+
+    if os.path.splitext(abs_path)[1].lower() == ".pdf":
+        from .pdf_attachments import read_attachment, staged_attachment_path
+
+        staged_path = staged_attachment_path(abs_path, member, max_bytes)
+        if staged_path is not None:
+            if is_document(staged_path):
+                return extract(staged_path)
+            return read_text(staged_path, max_bytes)
+
+        data = read_attachment(abs_path, member, max_bytes)
+        if data is None:
+            return None
+        suffix = os.path.splitext(member)[1]
+        handle, temp_path = tempfile.mkstemp(suffix=suffix, prefix="rag-pdf-member-")
+        os.close(handle)
+        try:
+            with open(temp_path, "wb") as target:
+                target.write(data)
+            if is_document(temp_path):
+                return extract(temp_path)
+            return read_text(temp_path, max_bytes)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
     try:
         with zipfile.ZipFile(abs_path) as archive:

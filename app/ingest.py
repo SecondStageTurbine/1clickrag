@@ -15,13 +15,16 @@ import os
 import threading
 from dataclasses import dataclass, field
 
+from .archive import SEPARATOR
 from .chunker import chunk_file
 from .config import CONFIG, Config
 from .embedder import make_embedder
 from .graph import open_graph
+from .pdf_attachments import attachment_staging
 from .scanner import (
     is_excluded,
     iter_archive_members,
+    iter_pdf_attachments,
     iter_source_files,
     language_for,
     load_text,
@@ -105,12 +108,14 @@ def index_file(
     abs_path = os.path.join(cfg.repo_path, source)
     if member:
         abs_path = f"{abs_path}!{member[1]}"
+    from .extract_cache import fingerprint_file
+    mtime = source_mtime(cfg, rel_path)
+    source_hash = fingerprint_file(os.path.join(cfg.repo_path, source))
     content = load_text(abs_path, cfg.max_file_bytes)
     if content is None:
         stats.files_skipped += 1
         return
 
-    mtime = source_mtime(cfg, rel_path)
     chunks = chunk_file(
         rel_path,
         language,
@@ -146,8 +151,10 @@ def index_file(
         payloads = [f"{c.path}\n{label(c)}\n\n{c.text}" for c in chunks]
     vectors = embedder.embed_documents(payloads, batch_size=cfg.embed_batch)
 
+    if source_mtime(cfg, rel_path) != mtime:
+        raise RuntimeError("Source changed during indexing; retry after the file is stable.")
     store.delete_path(rel_path)
-    store.upsert(chunks, vectors, mtime=mtime)
+    store.upsert(chunks, vectors, mtime=mtime, source_hash=source_hash)
 
     # The sidecar is updated from the same place, with the same delete-then-
     # insert, so keyword search and the entity graph cannot drift from the
@@ -253,7 +260,9 @@ def run_ingest(
     cfg = cfg or CONFIG
     stats = IngestStats()
 
-    with INGEST_LOCK:
+    with INGEST_LOCK, attachment_staging(
+        cfg.pdf_attachment_max_temp_bytes
+    ) as attachment_batches:
         embedder = embedder or make_embedder(cfg)
         store = store or Store(cfg.qdrant_url, cfg.collection, cfg.qdrant_path)
 
@@ -266,6 +275,25 @@ def run_ingest(
             embedder.prepare()
 
         store.ensure_collection(embedder.dim, recreate=full)
+
+        if paths is None and not full and cfg.pdf_attachments:
+            try:
+                indexed_for_staging = store.indexed_state()
+            except Exception as exc:
+                log.warning(
+                    "could not read index state for PDF attachment staging: %s", exc
+                )
+            else:
+                source_mtimes: dict[str, float | None] = {}
+
+                def attachment_needs_staging(abs_path: str, member: str) -> bool:
+                    source = os.path.relpath(abs_path, cfg.repo_path).replace(os.sep, "/")
+                    if source not in source_mtimes:
+                        source_mtimes[source] = source_mtime(cfg, source)
+                    known = indexed_for_staging.get(f"{source}{SEPARATOR}{member}")
+                    return not known or known.get("mtime") != source_mtimes[source]
+
+                attachment_batches.set_member_filter(attachment_needs_staging)
 
         graph = open_graph(cfg)
         if graph is not None and full:
@@ -294,11 +322,25 @@ def run_ingest(
                 # A changed archive means re-reading everything inside it.
                 if cfg.archives and is_archive(rel_path):
                     store.delete_path(rel_path)
+                    if graph is not None:
+                        graph.delete_path(rel_path)
                     targets.extend(iter_archive_members(rel_path, cfg))
                     continue
                 language = language_for(rel_path, cfg)
                 if language:
+                    include_pdf_attachments = (
+                        cfg.pdf_attachments
+                        and os.path.splitext(rel_path)[1].lower() == ".pdf"
+                    )
+                    if include_pdf_attachments:
+                        # One source owns both its page chunks and every virtual
+                        # attachment child. Clear them together before rebuilding.
+                        store.delete_path(rel_path)
+                        if graph is not None:
+                            graph.delete_path(rel_path)
                     targets.append((rel_path, language))
+                    if include_pdf_attachments:
+                        targets.extend(iter_pdf_attachments(rel_path, cfg))
         else:
             targets = list(iter_source_files(cfg))
             if not full:
