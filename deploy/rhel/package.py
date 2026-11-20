@@ -21,7 +21,7 @@ if action == "stage":
     target.mkdir(parents=True, exist_ok=False)
     for name in ("app", "tests", "deploy/rhel"):
         for source in (root / name).rglob("*"):
-            if source.is_file() and (source.suffix in {".py", ".html", ".css", ".js", ".sh", ".md", ".example"} or source.name == "Dockerfile.builder"):
+            if source.is_file() and (source.suffix in {".py", ".html", ".css", ".js", ".cjs", ".sh", ".md", ".example", ".txt"} or source.name == "Dockerfile.builder"):
                 dest = target / source.relative_to(root)
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(source.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
