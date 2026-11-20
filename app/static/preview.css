@@ -1,0 +1,36 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+:root { --preview-width: 48vw; }
+body.preview-open main { max-width: none; margin-right: var(--preview-width); }
+#source-preview { position: fixed; inset: 0 0 0 auto; width: var(--preview-width);
+  background: var(--bg); border-left: 1px solid var(--border); z-index: 20;
+  display: flex; flex-direction: column; box-shadow: -8px 0 24px #0001; }
+#preview-resize { position: absolute; left: -5px; top: 0; bottom: 0; width: 10px;
+  cursor: col-resize; touch-action: none; z-index: 2; }
+#preview-resize:focus-visible { outline: 2px solid var(--accent); }
+.preview-heading { padding: 16px 20px 10px; border-bottom: 1px solid var(--border); }
+.preview-heading .bar { flex-wrap: nowrap; align-items: flex-start; }
+#preview-title { flex: 1; margin: 0; overflow-wrap: anywhere; font-size: 15px; }
+#preview-close { padding: 4px 10px; }
+.preview-toolbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 20px; align-items: center; }
+.preview-toolbar button { padding: 5px 9px; font-size: 12px; }
+.preview-toolbar button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+#preview-warning, #preview-status { margin: 0; padding: 8px 20px; font-size: 12px; }
+#preview-warning:not(:empty) { background: #b779161c; border-bottom: 1px solid #b7791650; }
+#preview-status { color: var(--muted); }
+#preview-body { flex: 1; min-height: 0; overflow: auto; padding: 16px; background: var(--panel); }
+.preview-page { position: relative; width: 100%; background: white; }
+.preview-page img { width: 100%; height: auto; display: block; }
+.preview-box { position: absolute; background: #ffd84d66; outline: 1px solid #bb8500aa; pointer-events: none; }
+.preview-lines { background: var(--bg); border: 1px solid var(--border); padding: 8px 0; }
+.preview-line { display: flex; font: 12px/1.7 var(--mono); min-height: 1.7em; }
+.preview-line .line-number { flex: 0 0 64px; text-align: right; padding-right: 14px; color: var(--muted); user-select: none; }
+.preview-line .line-text { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; padding-right: 12px; }
+.preview-line.cited { background: #e6b52d35; border-left: 3px solid #d9a620; }
+.source-open { text-align: left; overflow-wrap: anywhere; padding: 3px 7px; font: inherit; }
+.preview-search { margin: 0 12px 12px; font-size: 12px; padding: 5px 9px; }
+button.cite { font: inherit; padding: 0 5px; border: 0; }
+@media (max-width: 850px) {
+  #source-preview { width: 100%; }
+  body.preview-open main { margin-right: auto; }
+  #preview-resize { display: none; }
+}

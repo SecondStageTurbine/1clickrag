@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 import time
 import uuid
@@ -203,6 +205,31 @@ class Store:
                 break
         return paths
 
+    def document_info(self, path: str) -> dict:
+        points, _ = self.client.scroll(
+            collection_name=self.collection, limit=1,
+            scroll_filter=qm.Filter(must=[qm.FieldCondition(key="path", match=qm.MatchValue(value=path))]),
+            with_payload=["mtime", "source_hash", "source", "content_version"], with_vectors=False,
+        )
+        return dict(points[0].payload or {}) if points else {}
+
+    def document_chunks(self, path: str) -> list[dict]:
+        chunks, offset, size = [], None, 0
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection, limit=256, offset=offset,
+                scroll_filter=qm.Filter(must=[qm.FieldCondition(key="path", match=qm.MatchValue(value=path))]),
+                with_payload=True, with_vectors=False,
+            )
+            for point in points:
+                payload = dict(point.payload or {})
+                size += len(payload.get("text", ""))
+                if size > 4_000_000 or len(chunks) >= 10000:
+                    raise ValueError("Document is too large for the text preview.")
+                chunks.append(payload)
+            if offset is None:
+                return sorted(chunks, key=lambda c: c.get("start_line", 0))
+
     # -- writes -----------------------------------------------------------
 
     def delete_path(self, path: str) -> None:
@@ -225,8 +252,13 @@ class Store:
         )
 
     def upsert(
-        self, chunks: list[Chunk], vectors: list[list[float]], mtime: float | None = None
+        self, chunks: list[Chunk], vectors: list[list[float]], mtime: float | None = None,
+        source_hash: str | None = None,
     ) -> None:
+        content_version = hashlib.sha256(json.dumps(
+            [(chunk.start_line, chunk.end_line, chunk.text) for chunk in chunks],
+            ensure_ascii=True, separators=(",", ":"),
+        ).encode()).hexdigest()
         points = [
             qm.PointStruct(
                 id=_point_id(chunk.path, i),
@@ -243,6 +275,8 @@ class Store:
                     # a later run tell "already indexed" from "indexed, then
                     # edited while nothing was watching".
                     "mtime": mtime,
+                    "source_hash": source_hash,
+                    "content_version": content_version,
                     "text": chunk.text,
                 },
             )
