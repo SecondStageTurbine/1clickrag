@@ -30,6 +30,8 @@ DOCUMENT_EXTS = {
     ".odt", ".ods", ".odp",
     ".rtf", ".eml", ".msg",
     ".csv", ".tsv", ".html", ".htm", ".xml",
+    # Cameo/MagicDraw model exports and BPMN: read as a graph, not as prose.
+    ".mdxml", ".xmi", ".uml", ".bpmn",
     # A comic archive: a zip of page images and nothing else. Readable only
     # with OCR on, and skipped with an explanation when it is off.
     ".cbz",
@@ -241,6 +243,20 @@ def from_pdf(path: str) -> str | None:
 
     pages = raw_pages if os.environ.get("RAG_PDF_KEEP_BOILERPLATE") else _strip_boilerplate(raw_pages)
 
+    # Structured diagram records must be added after running-header cleanup.
+    # Otherwise repeated fields such as "Method: diagram_geometry" can look
+    # like a footer and be removed from every diagram page.
+    if CONFIG.diagrams:
+        from . import diagram as diagram_module
+
+        diagrams = diagram_module.pdf_diagram_text(path, CONFIG)
+        if diagrams:
+            log.info("diagram analysis: %s - found topology on %d page(s)",
+                     path, len(diagrams))
+            for number, diagram_text in diagrams.items():
+                if 1 <= number <= len(pages):
+                    pages[number - 1].extend(["", diagram_text])
+
     parts: list[str] = []
     for number, lines in enumerate(pages, start=1):
         body = "\n".join(lines).strip()
@@ -315,13 +331,29 @@ def from_xlsx(path: str) -> str | None:
     parts: list[str] = []
     try:
         for sheet in book.worksheets:
+            stream = sheet.iter_rows(values_only=True)
+            try:
+                header_row = next(stream)
+            except StopIteration:
+                continue
+            headers = []
+            for index, value in enumerate(header_row):
+                header = str(value).strip() if value is not None else ""
+                headers.append(header or f"column{index + 1}")
             rows: list[str] = []
-            for row in sheet.iter_rows(values_only=True):
-                cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
-                if cells:
-                    rows.append(" | ".join(cells))
+            for row_index, row in enumerate(stream, start=2):
+                record_lines = [f"[row {row_index}]"]
+                for index, value in enumerate(row):
+                    if index >= len(headers):
+                        continue
+                    cell_text = str(value).strip() if value is not None else ""
+                    if not cell_text:
+                        continue
+                    record_lines.append(f"{headers[index]}: {cell_text}")
+                if len(record_lines) > 1:
+                    rows.append("\n".join(record_lines))
             if rows:
-                parts.append(f"[sheet {sheet.title}]\n" + "\n".join(rows))
+                parts.append(f"[sheet {sheet.title}]\n" + "\n\n".join(rows))
     finally:
         book.close()
     return _cap("\n\n".join(parts)) if parts else None
@@ -503,8 +535,21 @@ def from_msg(path: str) -> str | None:
     return _cap(text) if text.strip() else None
 
 
+def from_model(path: str) -> str | None:
+    from .sysml import from_model as render
+
+    return _cap(render(path) or "") or None
+
+
 def from_xml(path: str) -> str | None:
     import xml.etree.ElementTree as ET
+
+    from .sysml import is_model
+
+    # A .xml holding a Cameo export is a model, and flattening it to its text
+    # nodes throws away every relationship in it.
+    if is_model(path):
+        return from_model(path)
 
     try:
         root = ET.parse(path).getroot()
@@ -525,6 +570,10 @@ _EXTRACTORS = {
     ".eml": from_eml,
     ".msg": from_msg,
     ".xml": from_xml,
+    ".mdxml": from_model,
+    ".xmi": from_model,
+    ".uml": from_model,
+    ".bpmn": from_model,
     ".docx": from_docx,
     ".pptx": from_pptx,
     ".xlsx": from_xlsx,
