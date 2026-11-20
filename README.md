@@ -3,8 +3,9 @@
 
 Point it at a folder of documents and get a private, searchable index of them,
 running entirely on your machine. Vector store, embedding model, keyword index,
-entity graph, indexer, HTTP API and a browser UI - one command, no accounts, no
-API keys, no cloud, nothing leaves the box.
+entity graph, indexer, HTTP API and a browser UI - one command. Core retrieval
+needs no account, API key, or cloud service; optional chat uses only the model
+endpoint you explicitly configure.
 
 **Windows: double-click `Rag.bat`.** It asks which folder of documents to make
 searchable, then runs through the handful of extras that are off by default -
@@ -76,6 +77,7 @@ and is optional — with none configured, everything above works unchanged.
 | Slides | `.pptx` (per-slide), `.odp` |
 | Email | `.eml`, `.msg` (Outlook) |
 | Web / markup | `.html`, `.htm`, `.xml`, `.md`, `.txt` |
+| Models | `.mdxml`, `.xmi`, `.uml` (Cameo/MagicDraw, SysML, UML), `.bpmn` |
 | Code & config | `.rs`, `.py`, `.c`, `.sh`, `.ps1`, `.toml`, `.yaml`, `.json`, and more |
 | Scanned pages | any PDF page with no text layer, and `.cbz` — [with OCR on](#scanned-pages-ocr) |
 
@@ -103,6 +105,108 @@ while unbounded recursion is how a zip bomb becomes a disk-space incident.
 Guards: `RAG_ARCHIVE_MAX_BYTES` (500 MB), `RAG_ARCHIVE_MAX_MEMBERS` (2000), and
 `RAG_ARCHIVES=0` to switch it off entirely. Encrypted or corrupt entries are
 skipped with a log line, not fatal.
+
+**Excel files embedded in PDFs are indexed too.** Both document-level embedded
+files and page-level file-attachment annotations are discovered. A supplier
+attachment is cited as its own virtual child while the visible PDF pages remain
+searchable normally:
+
+```
+reports/supplier.pdf!Appendix Fault Descriptions.xlsx
+```
+
+`.xlsx`, `.xlsm`, `.xls`, and `.csv` attachments are supported. External web
+links are never downloaded. Guards: `RAG_PDF_ATTACHMENTS=0` disables the
+feature, `RAG_PDF_ATTACHMENT_MAX_BYTES` defaults to 25 MB per member, and
+`RAG_PDF_ATTACHMENT_MAX_MEMBERS` defaults to 100 per PDF. Embedded containers
+are not opened recursively. During ingest, each PDF's attachments are opened
+as one batch and staged under a private temporary directory rather than
+reopening the PDF for every workbook. `RAG_PDF_ATTACHMENT_MAX_TOTAL_BYTES`
+defaults to 100 MB per PDF and `RAG_PDF_ATTACHMENT_MAX_TEMP_BYTES` defaults to
+500 MB across one ingest. The staging directory is removed after the ingest,
+including when an error interrupts it.
+
+### Cameo / SysML model exports
+
+A model export is not a document. Its meaning is in which element owns which,
+which block satisfies which requirement, which flow leads where - and read as
+plain XML all of that disappears, because every `xmi:idref` stays an opaque
+string and the text nodes come out as a soup of names with no edges.
+
+So `.mdxml`, `.xmi`, `.uml` and `.bpmn` files are resolved into records before
+indexing. A `.xml` file is sniffed and takes the same path when it turns out to
+hold XMI or BPMN; anything else still reads as its text. Each element becomes a
+record carrying its name, metaclass, applied stereotypes, qualified name,
+documentation and - for value properties - multiplicity, default and unit:
+
+```
+[model element _17_0_1_abc]
+Name: Thrust Margin
+Type: Requirement
+Stereotypes: Requirement
+Qualified Name: Air Vehicle::Requirements::Thrust Margin
+Id: REQ-042
+Text: The vehicle shall hold a 10% thrust margin.
+```
+
+Stereotypes are matched on their `base_Class` / `base_Abstraction` attribute
+rather than their tag, so a profile this code has never seen still resolves.
+References become typed relationships, named by the stereotype where SysML puts
+the meaning there: `satisfies`, `verifies`, `derives_from`, `refines`,
+`traces_to`, `allocated_to`, plus `contains` for ownership, `specializes` for
+generalization, `has_part` for composition, `typed_by` for a property's type,
+`associated_with`, `depends_on`, `realizes`, and `flows_to` for item flows and
+BPMN sequence flows. Composition of a value type is recorded as a parameter,
+not as a part.
+
+Nothing here is guessed: every fact is a reference the file states, so each
+carries confidence 1.0 and the method `xmi_reference`, `xmi_containment` or
+`bpmn_reference`. Value properties are also written under the `Parameter Name`
+header the spreadsheet extractor uses, so a parameter named in a model and the
+same parameter named in an exported table land on one entity.
+
+Cameo's native `.mdzip` is not read. Export the project as XMI, or save it as
+`.mdxml`. Large models need `RAG_MAX_FILE_BYTES` raised above its 25 MB default.
+
+### Diagram-aware PDFs
+
+Simple flowcharts are converted into searchable graph evidence during PDF
+extraction. The first pass looks for rectangles, diamonds, circles, connector
+lines, and filled arrowheads. OCR runs only on pages that pass that geometry
+check. Text is assigned to its containing shape and an edge is recorded only
+when an arrow tail and head resolve to two different labeled nodes.
+
+The structured representation keeps the observed shape separate from its
+interpreted meaning (`rectangle` / `process`, `diamond` / `decision`, `circle`
+/ `connector`) and records normalized page coordinates, extraction method, and
+confidence. Arrow labels `Yes`, `No`, `True`, and `False` become
+`yes_branch_to` or `no_branch_to`; other arrows become `flows_to`. These
+relationships enter the existing hybrid retrieval alongside vectors, BM25,
+spreadsheet relationships, and entity hops. They never replace the page text.
+
+Off-page connector shapes are also recognized. When OCR finds an explicit
+reference such as `TO PAGE 5`, `CONTINUED ON PAGE 5`, or `FROM PAGE 3`, the
+extractor records a directional continuation through the referenced page. Page
+references are scoped to the current PDF, so page 5 of one manual cannot link
+to page 5 of another. This is based on printed diagram content; the PDF does
+not need to contain a clickable link. Numeric references are accepted only
+when the target page exists and is different from the current page. Matching
+`TO PAGE 5` and `FROM PAGE 3` connectors receive a higher confidence only when
+their page pair and connector labels agree; mismatched or one-sided references
+remain separate evidence.
+
+Candidate pages, detected nodes and edges, rejected page references, confidence
+scores, and reciprocal matches are written as one JSON review file per PDF in
+`.data/diagram-review`. Reports are replaced when that source is processed
+again, rather than appended indefinitely. Set `RAG_DIAGRAM_REVIEW=0` to disable
+them or `RAG_DIAGRAM_REVIEW_DIR` to move them. `GET /stats` reports the active
+directory and the number of review files.
+
+This is deliberately not general image captioning. It handles clean flowchart
+geometry and rejects pages without a detectable directed connection. Configure
+it with `RAG_DIAGRAMS` (on by default), `RAG_DIAGRAM_SCALE` (2.0),
+`RAG_DIAGRAM_MIN_CONFIDENCE` (0.55), and `RAG_DIAGRAM_MAX_PAGES` (500 per PDF).
+Set `RAG_DIAGRAMS=0` for the fastest ingest on a corpus without diagrams.
 
 ### Scanned pages (OCR)
 
@@ -312,6 +416,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:49404/search/full -Method POST -Body $bo
 | `/chat` | POST | A cited answer, streamed. 501 unless a generator is configured |
 | `/chat/config` | GET | Which generator answers by default, and where it sends the passages |
 | `/chat/models` | GET | Every generator this machine can reach, for the dropdown |
+| `/chat/modes` | GET | Server-owned task policies and retrieval profiles |
 | `/corpus/count` | POST | How many documents match, grouped by year, folder or extension |
 | `/classify` | POST | Decide one question about every row of a spreadsheet |
 | `/classify` | GET | Progress, rate and summary; `?verdicts=true` for the rows |
@@ -490,6 +595,54 @@ prepare the folder first **on the machine that does have access**:
 ```powershell
 .\rag-up.ps1 bundle
 ```
+
+### Classified / dark-network deployment
+
+For a disconnected classified enclave, build and vet the bundle on the
+approved staging system, then set this in the copy that crosses the boundary:
+
+```dotenv
+RAG_DARK_NETWORK=1
+```
+
+This is a fail-closed application control, not merely a statement that the
+network is offline. It makes fastembed and Hugging Face read only the staged
+model cache, disables Ollama model pulls, blocks Anthropic and public/default
+OpenAI endpoints, rejects public Qdrant/embedding/chat hosts, hides signed-in
+Claude/Codex CLIs, and prevents the launcher from falling back to PyPI. Docker
+mode also uses only already-loaded images (`--no-build --pull never`). A missing
+wheel, model, or image therefore stops startup instead of trying the Internet.
+
+The API remains on `127.0.0.1` because it has no built-in user authentication.
+If a central enclave service is required, put it behind the approved
+authenticating/TLS gateway first, then explicitly set:
+
+```dotenv
+RAG_HOST=0.0.0.0
+RAG_DARK_NETWORK_ALLOW_REMOTE=1
+RAG_DARK_NETWORK_ALLOWED_HOSTS=llm01.example.smil.mil
+```
+
+The allowlist is for exact internal FQDNs used by Qdrant or model services;
+loopback, RFC1918/link-local IPs, and the Compose service names are allowed
+without it. The model service must have its own network and telemetry controls.
+The supplied Compose file disables Qdrant usage telemetry and Ollama cloud
+features. For a separately installed Ollama service, set `OLLAMA_NO_CLOUD=1`
+in that service's environment and verify its log reports cloud is disabled.
+
+Before operational use, verify `/health` reports `dark_network: true`, run a
+search, stop/start the service, and confirm the chunk count and result set are
+unchanged. Treat all of `.data/` as classified at the corpus level: Qdrant,
+`graph.db`, extraction/context caches, diagram-review reports, queues, and logs
+can contain source text, relationships, filenames, or paths. Do not move a
+prebuilt index across classification boundaries.
+
+This setting does **not** provide an ATO, cross-domain transfer approval,
+host hardening, identity/access control, audit retention, malware review, or
+supply-chain approval. Pin and approve the Python/wheel/model/container inputs,
+record their hashes on the staging side, scan the transfer media, apply the
+enclave's file ACLs and backup policy, and have the ISSM/security authority
+approve the deployment and any remote access.
 
 That downloads every wheel into `vendor\wheels\` (~70 MB) and pre-downloads the
 embedding model into `.data\models\`. Then package it as a single file:
@@ -976,9 +1129,52 @@ Two things worth telling whoever wires up the generator:
 
 ## Chat in the browser
 
+Click a numbered citation in an answer to open its document in a resizable
+sidebar. Search results also have an **Open source** button. The conversation
+stays visible while you inspect the evidence; **Close** or Escape returns focus
+to the citation. Drag the divider (or focus it and use the arrow keys) to resize.
+
+For PDFs, the viewer renders the original page locally, jumps to the cited
+physical page when its page marker is available, and highlights a unique exact
+text match after normalizing whitespace. Previous/Next browse the document;
+**Back to citation** returns to the cited page. Rendering uses the existing
+`pypdfium2` dependency in an isolated process, without a CDN or internet service.
+Only the selected page is rendered, with a 30-second timeout and bounded image
+resolution. Original-file previews are limited to 100 MB or the configured file
+size limit, whichever is smaller.
+
+**Indexed text** shows line-numbered extracted text with the cited lines
+highlighted, including surrounding context. Text/Markdown, Office documents,
+archive members, and PDF attachments use this view; it does not reproduce
+Office layout or provide spreadsheet cell navigation. Long text previews show
+500 lines at a time with Previous/Next navigation.
+
+Scanned pages, diagram descriptions, ambiguous matches, and passages whose
+original text cannot be located do not receive guessed PDF highlights. The
+viewer explains this and offers the indexed text. When no PDF page marker is
+available, it opens page 1 without claiming to have located the citation.
+
+Newly ingested documents record source-content and extracted-content hashes.
+These detect changed original files (even if their timestamp was preserved) and
+reject citations from answers predating a changed index. Older index entries
+fall back to a timestamp check with an explicit notice until those documents
+are reindexed. Missing or modified originals retain an indexed-text preview.
+Preview requests must refer to indexed documents within the configured corpus;
+resolved paths outside that root are rejected and responses are not cached by
+the browser. A rebuild is not required to begin using the sidebar.
+
 The Chat tab is that seam with the wiring already done: it retrieves, hands the
 passages to a model you pick, and streams back an answer whose claims carry
 `[1]` `[2]` markers you can click to see the file and lines behind them.
+
+The **Task** dropdown controls a server-owned policy as well as retrieval. The
+default is general document Q&A. **Supplier fault-code maintenance trace**
+raises the retrieval depth and context budget, starts from exact fault codes,
+and performs bounded follow-up searches for referenced figures, blocks, and
+TO/FROM sheets before the model answers. Its response policy requests an
+ordered maintenance matrix and requires unreadable branches to remain
+unresolved rather than guessed. This is deliberately distinct from the model
+dropdown: changing the writer must not silently change the engineering task.
 
 **An "Answered by" dropdown lists whatever this machine can reach**, and the
 list is discovered rather than configured — a list in a config file is wrong
@@ -1177,6 +1373,15 @@ before this existed needs `Rag.bat reindex -Full` to populate it.
 most confidently: ticket IDs, part numbers, standards, error codes. `NW-2200`
 means nothing in vector space. So the same chunks are also indexed for BM25,
 and the two rankings are fused rather than chosen between:
+
+**Structured spreadsheet relationships.** XLSX rows are extracted as
+`Column header: value` pairs while retaining the sheet and row number.
+Recognised fields such as fault condition, parameter name, ARINC label, and
+artifact create typed relationships only when both values are explicitly
+present in the same row. Every relationship keeps its source chunk, confidence,
+and inference type. These results are another hybrid ranking arm; they do not
+replace vector or keyword search. Re-index with `Rag.bat reindex -Full` after
+upgrading an existing index so spreadsheet rows and relationships are rebuilt.
 
 ```powershell
 $body = @{query='NW-2200 pressure fault'; top_k=8} | ConvertTo-Json
@@ -1409,6 +1614,36 @@ list, so a citation in the answer still resolves against what you were shown.
 
 ## When a setting changes under a built index
 
+Document embeddings are cached on disk. Editing a file reuses vectors for
+chunks whose exact embedding input is unchanged, including any embedded path
+and section label. Rebuilds and restarts reuse the same cache; new text or a
+different embedding configuration gets new vectors. Queries still run against
+the active model. The cache fills during ingestion; existing index vectors are
+not automatically imported.
+
+`RAG_EMBED_CACHE=0` disables reuse. `RAG_EMBED_CACHE_PATH` defaults to
+`embedding-cache.db` in the data directory. `RAG_EMBED_CACHE_MAX_MB=512` bounds
+stored vector bytes with oldest-used entries evicted first (SQLite adds file
+overhead). The cache contains input hashes and vectors, not source text, and
+should be protected like the index. Cache read/write failures are logged and
+fall back to computing embeddings. `/health` includes `embedding_cache` with
+process-local hit/miss counts for requested document chunks.
+Docker Compose keeps the cache in its own `embedding-cache` volume at
+`/embedding-cache/vectors.db`, so replacing the API container preserves reuse.
+
+The manifest and cache share a fingerprint of the model, backend, active HTTP
+prefixes, service endpoint, explicit revision marker, and FastEmbed version
+when applicable. Authentication headers are excluded; endpoint identity is
+persisted only as part of the digest. The measured vector dimension is also
+checked separately. Older manifests without a fingerprint retain their existing
+drift checks; missing historical settings cannot be reconstructed.
+
+If weights or server-side tokenization, pooling, normalization, or truncation
+change under the same model name, change `RAG_EMBED_REVISION` and run a full
+reindex. This is an identity marker, not a model-download revision selector.
+Such hidden changes cannot be detected automatically. A full reindex can reuse
+valid cached vectors; disable the cache if you explicitly need fresh computation.
+
 Several settings decide what ends up in the vectors — the embedding model, the
 chunk size, which label rides along with the text. Change one and the chunks
 already indexed keep whatever the old setting produced, while everything
@@ -1535,6 +1770,16 @@ file. Use `grep` for exact symbols or strings, or when you know the path: it is
 faster and more precise for those. The two are complements, not competitors -
 `Find-RagLiteral` is the grep half, scoped to the same project subtree, and the
 client falls back to it automatically when retrieval comes up empty.
+
+## Diagnostic and peer-review chat modes
+
+General document Q&A remains the default. Optional Task selections add supplier
+fault-code maintenance tracing, diagnostic artifact review, a symptom–failure
+matrix, diagnostic peer review, and source-marking peer review. Peer review
+automatically attaches the latest completed non-peer answer and its original
+retrieved evidence; original `[P1]` citations stay separate from new search
+citations. This is advisory analysis, not maintenance approval or classification
+authority. See [review-mode usage, installation, tests, and limitations](REVIEW-MODES-UPDATE.md).
 
 ## Checking the corpus without installing anything
 

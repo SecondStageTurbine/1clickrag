@@ -5,6 +5,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Local RAG — Retrieval-Augmented Generation</title>
+<link rel="stylesheet" href="/preview.css">
 <style>
   :root {
     color-scheme: light dark;
@@ -312,14 +313,17 @@
 
   <section id="pane-chat" hidden>
     <div class="picker">
+      <label for="chat-mode">Task</label>
+      <select id="chat-mode" title="Backend policy and retrieval behavior for this task."></select>
       <label for="backend">Answered by</label>
       <select id="backend" title="Which model writes the answer. Retrieval is the same whichever you pick."></select>
     </div>
     <div class="destination" id="destination"></div>
+    <p class="hint" id="mode-hint"></p>
     <div id="transcript"></div>
     <p class="hint" id="chat-hint">
       Answers are written from the passages this index retrieves, and cite them —
-      click a <span class="cite">1</span> to see which document it came from. The
+      click a <span class="cite">1</span> to open its source beside the answer. The
       filters above apply to what gets retrieved for each question. Nothing is
       stored: reloading the page starts a new conversation.
     </p>
@@ -436,12 +440,13 @@ function renderMeta(data) {
 
 function render(data) {
   const box = $('results');
+  box.previewSources = data.results || [];
   renderMeta(data);
   if (!data.results || !data.results.length) {
     box.innerHTML = '<div class="empty">No matches.</div>';
     return;
   }
-  box.innerHTML = data.results.map((r) => {
+  box.innerHTML = data.results.map((r, index) => {
     // The symbol is a useful label for a function signature or a heading, and
     // pure noise for plain text, where it is simply the chunk's first line
     // repeated directly above itself. Show it only when it adds something.
@@ -462,6 +467,7 @@ function render(data) {
           }${r.language} · ${Number(r.score).toFixed(3)}</span></h2>
       ${showSymbol ? `<div class="sym">${escapeHtml(r.symbol)}</div>` : ''}
       <pre>${escapeHtml(r.text)}</pre>
+      <button class="ghost preview-search" data-index="${index}" type="button">Open source</button>
     </div>`;
   }).join('');
 }
@@ -516,6 +522,7 @@ $('reindex').addEventListener('click', async () => {
 // The whole conversation, since the server holds none: it is stateless by
 // design, so two tabs never share a history and a reload never resumes one.
 let history = [];
+let reviewSnapshot = null;
 let busy = false;
 
 function showTab(which) {
@@ -601,13 +608,30 @@ $('only-changed').addEventListener('change', renderSettings);
 let backends = {};
 
 async function loadChatConfig() {
-  let cfg, list;
+  let cfg, list, modeList;
   try {
     cfg = await (await fetch('/chat/config')).json();
     if (!cfg.enabled) return;  // tab stays hidden; search is unaffected
-    list = await (await fetch('/chat/models')).json();
+    [list, modeList] = await Promise.all([
+      fetch('/chat/models').then((response) => response.json()),
+      fetch('/chat/modes').then((response) => response.json()),
+    ]);
   } catch (e) { return; }
   $('tab-chat').hidden = false;
+
+  const modeSelect = $('chat-mode');
+  modeSelect.innerHTML = '';
+  for (const mode of (modeList.modes || [])) {
+    const option = document.createElement('option');
+    option.value = mode.id;
+    option.textContent = mode.label;
+    option.title = mode.description;
+    option.dataset.peerReview = String(Boolean(mode.peer_review));
+    modeSelect.appendChild(option);
+  }
+  const rememberedMode = localStorage.getItem('rag-chat-mode');
+  modeSelect.value = [...modeSelect.options].some((option) => option.value === rememberedMode)
+    ? rememberedMode : (modeList.default || 'general');
 
   const select = $('backend');
   backends = {};
@@ -627,6 +651,18 @@ async function loadChatConfig() {
   select.value = (remembered && backends[remembered]) ? remembered : (list.default || '');
   if (!select.value && select.options.length) select.selectedIndex = 0;
   describeBackend();
+  describeMode();
+}
+
+function peerModeSelected() {
+  return $('chat-mode').selectedOptions[0]?.dataset.peerReview === 'true';
+}
+
+function describeMode() {
+  const option = $('chat-mode').selectedOptions[0];
+  $('mode-hint').textContent = (option?.title || '') + (peerModeSelected()
+    ? (reviewSnapshot ? ' Original answer and evidence are attached automatically. [P#] references appear in the review-input panel; new [#] references open source previews.'
+      : ' First complete an analysis in a non-peer mode. Reloading or New clears the review input.') : '');
 }
 
 function describeBackend() {
@@ -636,7 +672,7 @@ function describeBackend() {
   box.hidden = false;
   box.className = 'destination' + (b.local ? '' : ' remote');
   const where = b.local
-    ? 'runs on this machine — nothing leaves it'
+    ? 'uses this machine or a private-network endpoint'
     : '<span class="flag">⚠ your questions and the retrieved passages leave this machine</span>';
   box.innerHTML =
     `<b>${escapeHtml(b.model || b.label)}</b>` +
@@ -649,6 +685,11 @@ $('backend').addEventListener('change', () => {
   describeBackend();
 });
 
+$('chat-mode').addEventListener('change', () => {
+  localStorage.setItem('rag-chat-mode', $('chat-mode').value);
+  describeMode();
+});
+
 // Deliberately not a Markdown renderer. The three things a grounded answer
 // actually uses are code spans, bold, and citation markers; everything else
 // survives as written, because escaped plain text is never wrong and a
@@ -657,7 +698,7 @@ function formatAnswer(text) {
   return escapeHtml(text)
     .replace(/`([^`\n]+)`/g, (m, code) => `<code>${code}</code>`)
     .replace(/\*\*([^*\n]+)\*\*/g, (m, bold) => `<b>${bold}</b>`)
-    .replace(/\[(\d{1,2})\]/g, (m, n) => `<span class="cite" data-n="${n}">${n}</span>`);
+    .replace(/\[(\d{1,2})\]/g, (m, n) => `<button type="button" class="cite" data-n="${n}" aria-label="Open citation ${n}">${n}</button>`);
 }
 
 function countsHtml(counted) {
@@ -669,7 +710,7 @@ function sourcesHtml(sources) {
   if (!sources || !sources.length) return '';
   const items = sources.map((s) => {
     const heading = s.heading ? ` <b>(${escapeHtml(s.heading)})</b>` : '';
-    return `<li data-n="${s.n}">${escapeHtml(s.citation)}${heading}</li>`;
+    return `<li data-n="${s.n}"><button type="button" class="ghost source-open" data-n="${s.n}">${escapeHtml(s.citation)}${heading}</button></li>`;
   }).join('');
   return `<details class="sources"><summary>${sources.length} passage${
     sources.length === 1 ? '' : 's'}</summary><ol>${items}</ol></details>`;
@@ -685,25 +726,17 @@ function addTurn(role, html, cls) {
   return el;
 }
 
-// Clicking a citation opens that answer's source list and highlights the line,
-// so a claim can be traced to a file and line range without leaving the page.
-$('transcript').addEventListener('click', (event) => {
-  const chip = event.target.closest('.cite');
-  if (!chip) return;
-  const turn = chip.closest('.turn');
-  const details = turn && turn.querySelector('details.sources');
-  if (!details) return;
-  details.open = true;
-  for (const li of details.querySelectorAll('li')) {
-    li.classList.toggle('lit', li.dataset.n === chip.dataset.n);
-  }
-  details.querySelector(`li[data-n="${chip.dataset.n}"]`)
-    ?.scrollIntoView({block: 'nearest'});
-});
+// Citation navigation is handled by the local preview sidebar in preview.js.
 
 async function send() {
   const question = $('msg').value.trim();
   if (!question || busy) return;
+  const review = peerModeSelected() ? reviewSnapshot : null;
+  if (peerModeSelected() && !review) {
+    describeMode();
+    return;
+  }
+  const selectedMode = $('chat-mode').value || 'general';
   busy = true;
   $('send').disabled = true;
   $('msg').value = '';
@@ -715,6 +748,8 @@ async function send() {
   let answer = '';
   let sources = [];
   let counted = [];
+  let completed = false;
+  let reviewEvidence = null;
 
   const paint = () => {
     body.innerHTML = formatAnswer(answer) + '<span class="caret"></span>';
@@ -729,6 +764,8 @@ async function send() {
         top_k: parseInt($('topk').value, 10),
         retrieve: $('retrieve').checked,
         backend: $('backend').value || null,
+        mode: selectedMode,
+        review,
         ...filters(),
       }),
     });
@@ -759,6 +796,7 @@ async function send() {
         const payload = JSON.parse(data);
         if (name === 'sources') {
           sources = payload.sources || [];
+          turn.previewSources = sources;
         } else if (name === 'count') {
           // A number the server computed over the whole index, not a passage.
           // Shown because "142 of 5,000 documents" is the evidence for the
@@ -784,13 +822,28 @@ async function send() {
         } else if (name === 'error') {
           throw new Error(payload.error);
         } else if (name === 'done') {
+          completed = true;
+          reviewEvidence = payload.review_evidence;
           break outer;
         }
       }
     }
 
+    if (!completed) throw new Error('The response stream ended before completion; no review snapshot saved.');
     if (!answer.trim()) throw new Error('the generator returned nothing');
     body.innerHTML = formatAnswer(answer) + countsHtml(counted) + sourcesHtml(sources);
+    if (review) {
+      const panel = document.createElement('details');
+      const original = review.analysis.replace(/\[(\d+)\]/g, '[P$1]');
+      const evidence = review.evidence.replace(/^\[(\d+)\](?= )/gm, '[P$1]');
+      panel.innerHTML = '<summary>Original review input — [P#] evidence</summary><pre style="white-space:pre-wrap"></pre>';
+      panel.querySelector('pre').textContent = original + '\n\nOriginal evidence:\n' + (evidence || 'Not supplied');
+      body.appendChild(panel);
+    } else {
+      reviewSnapshot = answer.length <= 60000 && typeof reviewEvidence === 'string'
+        ? {analysis: answer, evidence: reviewEvidence} : null;
+    }
+    describeMode();
     history.push({role: 'assistant', content: answer});
   } catch (e) {
     turn.className = 'turn error';
@@ -811,6 +864,8 @@ async function send() {
 $('send').addEventListener('click', send);
 $('reset').addEventListener('click', () => {
   history = [];
+  reviewSnapshot = null;
+  describeMode();
   $('transcript').innerHTML = '';
   $('msg').focus();
 });
@@ -822,5 +877,6 @@ refreshStatus();
 loadChatConfig();
 setInterval(refreshStatus, 5000);
 </script>
+<script src="/preview.js"></script>
 </body>
 </html>

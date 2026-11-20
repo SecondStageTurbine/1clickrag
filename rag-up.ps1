@@ -148,6 +148,12 @@ function Get-EnvValue {
     return $null
 }
 
+function Test-DarkNetwork {
+    $value = $env:RAG_DARK_NETWORK
+    if ($null -eq $value) { $value = Get-EnvValue 'RAG_DARK_NETWORK' }
+    return ($value -and $value.Trim().ToLower() -in @('1', 'true', 'yes', 'on'))
+}
+
 function Read-YesNo {
     param([string]$Prompt, [bool]$Default)
 
@@ -478,6 +484,7 @@ function Wait-Healthy {
     $deadline = (Get-Date).AddMinutes($minutes)
     $last = ''
     $lastChunks = -1
+    $opened = $false
     while ((Get-Date) -lt $deadline) {
         if ($Proc -and $Proc.HasExited) {
             Write-Host ''
@@ -497,6 +504,11 @@ function Wait-Healthy {
             if ($health.status -ne $last) {
                 Write-Host "    status: $($health.status)"
                 $last = $health.status
+                # The UI serves from the first chunk; only the launcher was waiting.
+                if ($health.status -eq 'indexing') {
+                    Write-Host "    UI is up now at $Api - search works on what is indexed so far"
+                    if (-not $NoBrowser -and -not $opened) { Start-Process $Api; $opened = $true }
+                }
             }
             # A big corpus spends a long time here; show it moving.
             if ($health.status -eq 'indexing' -and $health.chunks -ne $lastChunks) {
@@ -510,7 +522,7 @@ function Wait-Healthy {
                 Write-Host ''
                 Write-Host '    Open it in a browser, or:'
                 Write-Host "      .\rag-up.ps1 query 'where is the IPC rendezvous done?'"
-                if (-not $NoBrowser) { Start-Process $Api }
+                if (-not $NoBrowser -and -not $opened) { Start-Process $Api }
                 return $true
             }
             # A recorded bootstrap error is terminal - the model download
@@ -567,6 +579,15 @@ function Show-InstallHelp {
 }
 
 function Initialize-Venv {
+    if (Test-DarkNetwork) {
+        # Defense in depth around pip and transitive model libraries. The
+        # install command also says --no-index, but these prevent a nested tool
+        # or future refactor from silently weakening the boundary.
+        $env:PIP_NO_INDEX = '1'
+        $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        $env:HF_HUB_OFFLINE = '1'
+        $env:TRANSFORMERS_OFFLINE = '1'
+    }
     # A virtualenv records absolute paths to the Python that built it, so one
     # copied from another machine looks present and then fails cryptically.
     # Probe it and rebuild rather than inflicting that error on the user.
@@ -602,6 +623,11 @@ function Initialize-Venv {
             $result = Invoke-Pip @('install', '--quiet', '--no-index', '--find-links', $Wheels,
                                    '-r', 'requirements-native.txt')
         } else {
+            if (Test-DarkNetwork) {
+                Write-Error ('dark-network mode will not contact PyPI. ' +
+                    'vendor\wheels is missing; build the offline bundle on an approved ' +
+                    'connected staging machine, then transfer and verify it.')
+            }
             Write-Host '==> installing dependencies (first run only)' -ForegroundColor Cyan
             $null = Invoke-Pip @('install', '--quiet', '--upgrade', 'pip')
             $result = Invoke-Pip @('install', '--quiet', '-r', 'requirements-native.txt')
@@ -1408,8 +1434,12 @@ function Start-Native {
     Initialize-Venv
 
     Write-Host '==> starting the RAG server' -ForegroundColor Cyan
-    Write-Host '    (first run downloads the embedding model, then indexes the repo;'
-    Write-Host '     later starts reuse both and take seconds)'
+    if (Test-DarkNetwork) {
+        Write-Host '    dark-network mode: staged packages/models only; no cloud fallback'
+    } else {
+        Write-Host '    (first run downloads the embedding model, then indexes the repo;'
+        Write-Host '     later starts reuse both and take seconds)'
+    }
 
     $env:RAG_MODE = 'native'
     $proc = Start-Process -FilePath $VenvPy -ArgumentList '-m', 'app.server' `
@@ -1443,8 +1473,13 @@ function Start-Native {
 }
 
 function Start-DockerStack {
-    Write-Host '==> building and starting the containerised stack' -ForegroundColor Cyan
-    Invoke-Compose @('up', '-d', '--build')
+    if (Test-DarkNetwork) {
+        Write-Host '==> starting preloaded container images (builds/pulls disabled)' -ForegroundColor Cyan
+        Invoke-Compose @('up', '-d', '--no-build', '--pull', 'never')
+    } else {
+        Write-Host '==> building and starting the containerised stack' -ForegroundColor Cyan
+        Invoke-Compose @('up', '-d', '--build')
+    }
     Write-Host '==> waiting for the index' -ForegroundColor Cyan
     if (-not (Wait-Healthy)) { Write-Error 'not healthy. Check: .\rag-up.ps1 -Docker logs' }
 }
@@ -1558,7 +1593,14 @@ switch ($Command) {
         else { Register-Autostart -AsSystem:$System -EveryMinutes $EveryMinutes }
     }
 
-    'bundle' { New-Bundle; if ($Gpu) { New-GpuBundle } }
+    'bundle' {
+        if (Test-DarkNetwork) {
+            Write-Error ('bundle downloads supply-chain inputs and is disabled by ' +
+                'RAG_DARK_NETWORK=1. Build it on the approved staging machine.')
+        }
+        New-Bundle
+        if ($Gpu) { New-GpuBundle }
+    }
     'gpu' { Install-Gpu }
 
     'package' { New-Package }

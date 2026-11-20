@@ -13,9 +13,11 @@ rag-eval.json
 
 # The virtualenv rag-up creates on first run.
 .venv/
+.venv-rhel/
 
 # Wheels vendored by `rag-up bundle` for offline install on another machine.
 vendor/
+dist/
 
 # Packages produced by `rag-up package`.
 *.zip
@@ -29,3 +31,9 @@ rag.pid
 
 __pycache__/
 *.pyc
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Local .env backups can hold credentials.
+.env.bak-*

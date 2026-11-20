@@ -126,6 +126,11 @@ LANGUAGE_BY_EXT: dict[str, str] = {
     ".eml": "email",
     ".msg": "email",
     ".xml": "xml",
+    # Cameo/MagicDraw model exports and BPMN process definitions.
+    ".mdxml": "model",
+    ".xmi": "model",
+    ".uml": "model",
+    ".bpmn": "model",
     # A comic archive - page images in a zip. Only readable with RAG_OCR=1.
     ".cbz": "comic",
 }
@@ -210,6 +215,18 @@ class Config:
     """Resolved runtime configuration."""
 
     mode: str = MODE
+    # Classified/disconnected deployment guard. This is deliberately stronger
+    # than "the network has no route": it disables download behavior and
+    # rejects cloud/public endpoints before any client is created.
+    dark_network: bool = _env_bool("RAG_DARK_NETWORK", False)
+    dark_network_allowed_hosts: list[str] = field(
+        default_factory=lambda: _env_list("RAG_DARK_NETWORK_ALLOWED_HOSTS", [])
+    )
+    # The API has no built-in identity layer. Remote binding is therefore an
+    # explicit decision reserved for an approved authenticating gateway.
+    dark_network_allow_remote: bool = _env_bool(
+        "RAG_DARK_NETWORK_ALLOW_REMOTE", False
+    )
     repo_path: str = os.environ.get("RAG_REPO_MOUNT", _DEFAULT_REPO)
     repo_label: str = os.environ.get("RAG_REPO_LABEL", "repository")
 
@@ -231,6 +248,13 @@ class Config:
         "RAG_EMBED_MODEL",
         "nomic-embed-text" if _IS_DOCKER else "nomic-ai/nomic-embed-text-v1.5",
     )
+    # Identity marker only; does not download or select a model revision.
+    embed_revision: str = os.environ.get("RAG_EMBED_REVISION", "")
+    embed_cache: bool = _env_bool("RAG_EMBED_CACHE", True)
+    embed_cache_path: str = os.environ.get(
+        "RAG_EMBED_CACHE_PATH", os.path.join(_DEFAULT_DATA, "embedding-cache.db")
+    )
+    embed_cache_max_mb: int = _env_int("RAG_EMBED_CACHE_MAX_MB", 512)
     ollama_url: str = os.environ.get("RAG_OLLAMA_URL", "http://ollama:11434")
     auto_pull_model: bool = _env_bool("RAG_AUTO_PULL_MODEL", True)
     # Where fastembed caches its ONNX weights (first run downloads them).
@@ -582,9 +606,78 @@ class Config:
     archives: bool = _env_bool("RAG_ARCHIVES", True)
     archive_max_bytes: int = _env_int("RAG_ARCHIVE_MAX_BYTES", 500_000_000)
     archive_max_members: int = _env_int("RAG_ARCHIVE_MAX_MEMBERS", 2000)
+    # Spreadsheet files embedded in PDFs, including page-level FileAttachment
+    # annotations used by supplier reports. External hyperlinks are never
+    # downloaded. Limits bound malicious or accidentally enormous containers.
+    pdf_attachments: bool = _env_bool("RAG_PDF_ATTACHMENTS", True)
+    pdf_attachment_max_bytes: int = _env_int(
+        "RAG_PDF_ATTACHMENT_MAX_BYTES", 25_000_000
+    )
+    pdf_attachment_max_members: int = _env_int("RAG_PDF_ATTACHMENT_MAX_MEMBERS", 100)
+    pdf_attachment_max_total_bytes: int = _env_int(
+        "RAG_PDF_ATTACHMENT_MAX_TOTAL_BYTES", 100_000_000
+    )
+    pdf_attachment_max_temp_bytes: int = _env_int(
+        "RAG_PDF_ATTACHMENT_MAX_TEMP_BYTES", 500_000_000
+    )
 
+    # Diagram-aware PDF extraction. A cheap geometry pass runs first; OCR is
+    # invoked only on pages containing multiple flowchart shapes and an
+    # arrowhead. Disable for maximum ingest speed or corpora with no diagrams.
+    diagrams: bool = _env_bool("RAG_DIAGRAMS", True)
+    diagram_scale: float = float(os.environ.get("RAG_DIAGRAM_SCALE", "2.0"))
+    diagram_min_confidence: float = float(
+        os.environ.get("RAG_DIAGRAM_MIN_CONFIDENCE", "0.55")
+    )
+    diagram_max_pages: int = _env_int("RAG_DIAGRAM_MAX_PAGES", 500)
+    diagram_review: bool = _env_bool("RAG_DIAGRAM_REVIEW", True)
+    diagram_review_dir: str = os.environ.get(
+        "RAG_DIAGRAM_REVIEW_DIR", os.path.join(_DEFAULT_DATA, "diagram-review")
+    )
 
     def __post_init__(self) -> None:
+        if self.dark_network:
+            # fastembed/huggingface must use the staged cache. Both variables
+            # are set because transitive model libraries do not all consult
+            # the same switch.
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            self.auto_pull_model = False
+
+            from .network_policy import require_internal_url, require_loopback_bind
+
+            require_loopback_bind(self.host, self.dark_network_allow_remote)
+            allowed = self.dark_network_allowed_hosts
+            if self.qdrant_url:
+                require_internal_url(self.qdrant_url, "Qdrant", allowed)
+            if self.embed_backend == "ollama":
+                require_internal_url(self.ollama_url, "Ollama embeddings", allowed)
+            elif self.embed_backend in ("http", "openai"):
+                if not self.embed_url:
+                    raise ValueError(
+                        "RAG_EMBED_URL is required for HTTP embeddings in "
+                        "dark-network mode"
+                    )
+                require_internal_url(self.embed_url, "embedding service", allowed)
+
+            provider = self.chat_provider
+            if provider in ("anthropic", "claude"):
+                raise ValueError(
+                    "Anthropic/Claude cloud chat is disabled in dark-network mode"
+                )
+            if provider in ("openai", "codex", "local", "openai-compatible"):
+                if not self.chat_url:
+                    raise ValueError(
+                        "RAG_CHAT_URL must explicitly name an enclave-local service "
+                        "in dark-network mode; the public OpenAI default is disabled"
+                    )
+                require_internal_url(self.chat_url, "chat service", allowed)
+            elif provider == "ollama":
+                require_internal_url(
+                    self.chat_url or "http://127.0.0.1:11434",
+                    "Ollama chat", allowed,
+                )
+
         if self.rescan_minutes < 0:
             # A watched local disk needs no polling; an unwatched share needs
             # it to stay current at all.
